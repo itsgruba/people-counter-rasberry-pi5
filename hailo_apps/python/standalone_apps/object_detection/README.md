@@ -1,3 +1,7 @@
+python3 object_detection.py \
+  --hef-path yolov8m \
+  --input http://172.20.10.13:81/stream
+
 Object Detection
 ================
 

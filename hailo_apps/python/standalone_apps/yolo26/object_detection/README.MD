@@ -1,3 +1,7 @@
+python3 object_detection_onnx_postproc.py \
+  --hef-path yolo26n \
+  --input http://172.20.10.13:81/stream
+
 Object detection - *yolo26* with lightweight ONNX postprocessing
 ================================================================
 

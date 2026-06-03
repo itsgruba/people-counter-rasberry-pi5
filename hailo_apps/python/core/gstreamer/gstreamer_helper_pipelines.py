@@ -51,6 +51,8 @@ def get_source_type(input_source):
         return "ximage"
     elif input_source.startswith('rtsp://'):
         return 'rtsp'
+    elif input_source.startswith('http://') or input_source.startswith('https://'):
+        return 'http'
     elif input_source.startswith('udp://'):
         return 'udp'
     elif input_source.lower().endswith(('.jpg', '.jpeg', '.png', '.bmp')):
@@ -167,6 +169,13 @@ def SOURCE_PIPELINE(
             f'rtspsrc location="{video_source}" name={name} ! '
             f'{QUEUE(name=f"{name}_queue_decode")} ! '
             f'decodebin name={name}_decodebin ! '
+        )
+    elif source_type == 'http':  # HTTP MJPEG stream, e.g. ESP32-CAM
+        source_element = (
+            f'souphttpsrc location="{video_source}" is-live=true do-timestamp=true name={name} ! '
+            f'multipartdemux ! '
+            f'{QUEUE(name=f"{name}_queue_decode")} ! '
+            f'jpegdec name={name}_jpegdec ! '
         )
     elif source_type == 'udp':  # UDP stream handling (e.g., Gazebo camera)
         # Extract port from udp://host:port or udp://:port
