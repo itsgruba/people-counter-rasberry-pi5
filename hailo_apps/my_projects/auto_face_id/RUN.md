@@ -9,7 +9,8 @@ This guide is for the combined `person -> face` prototype.
 - removes non-`person` detections from the final ROI before display
 - recognizes known faces
 - enrolls unknown faces and assigns a `global_id`
-- keeps `global_id` on the person box, not on the face box
+- keeps the simple identity label such as `person_1` on the person box, not on the face box
+- shows `Unknown` on a person box until an identity is assigned
 
 ## Video Stream
 
@@ -37,6 +38,7 @@ python3 my_projects/auto_face_id/person_face_id.py \
 
 - If your person detector uses a different class ID, pass `--person-class-id <id>`.
 - The main Hailo display should now show both `person` and `face` boxes.
+- The face box should not show a person ID. Only the person box shows `Unknown` or `person_N`.
 - `--use-frame` is optional and only opens an extra debug window from Python.
 - The app stores its database and samples in:
 

@@ -221,7 +221,6 @@ class PersonFaceIdApp(GStreamerApp):
         self.pending_unknowns: dict[int, PendingIdentity] = {}
         self.face_track_embeddings: dict[int, np.ndarray] = {}
         self.track_to_global_id: dict[int, str] = {}
-        self.person_track_to_global_id: dict[int, str] = {}
         self.track_to_label: dict[int, str] = {}
         self.last_printed_identity: dict[int, str] = {}
         self.recognition_stats = self._new_recognition_stats()
@@ -572,8 +571,6 @@ class PersonFaceIdApp(GStreamerApp):
     def _enroll_if_ready(
         self,
         track_id: int,
-        face_track_id: int,
-        face_detection,
         person_detection,
     ) -> None:
         pending = self.pending_unknowns.get(track_id)
@@ -586,15 +583,8 @@ class PersonFaceIdApp(GStreamerApp):
             self.track_to_global_id[track_id] = person["global_id"]
             self.track_to_label[track_id] = person["label"]
             self._add_identity_classification(
-                face_detection,
-                person["label"],
-                confidence,
-                self.face_tracker_name,
-                face_track_id,
-            )
-            self._add_identity_classification(
                 person_detection,
-                person["global_id"],
+                person["label"],
                 confidence,
                 self.person_tracker_name,
                 track_id,
@@ -631,15 +621,8 @@ class PersonFaceIdApp(GStreamerApp):
         self.track_to_global_id[track_id] = new_person["global_id"]
         self.track_to_label[track_id] = label
         self._add_identity_classification(
-            face_detection,
-            label,
-            1.0,
-            self.face_tracker_name,
-            face_track_id,
-        )
-        self._add_identity_classification(
             person_detection,
-            new_person["global_id"],
+            label,
             1.0,
             self.person_tracker_name,
             track_id,
@@ -650,7 +633,6 @@ class PersonFaceIdApp(GStreamerApp):
     def _handle_unknown_person(
         self,
         track_id: int,
-        face_track_id: int,
         frame_number: int,
         frame: np.ndarray,
         face_detection,
@@ -684,7 +666,7 @@ class PersonFaceIdApp(GStreamerApp):
             f"collecting: track_id={track_id} samples="
             f"{len(pending.samples)}/{self.samples_per_person}"
         )
-        self._enroll_if_ready(track_id, face_track_id, face_detection, person_detection)
+        self._enroll_if_ready(track_id, person_detection)
 
     def get_pipeline_string(self):
         source_pipeline = self.get_source_pipeline()
@@ -786,17 +768,14 @@ class PersonFaceIdApp(GStreamerApp):
             person_track_id = self._get_track_id(person_detection)
             if person_track_id is None:
                 continue
-            global_id = self.track_to_global_id.get(person_track_id)
-            if global_id is None:
-                continue
+            display_id = self.track_to_label.get(person_track_id, "Unknown")
             self._add_identity_classification(
                 person_detection,
-                global_id,
+                display_id,
                 1.0,
                 self.person_tracker_name,
                 person_track_id,
             )
-            self.person_track_to_global_id[person_track_id] = global_id
 
         pad = element.get_static_pad("src")
         fmt, width, height = get_caps_from_pad(pad)
@@ -844,23 +823,16 @@ class PersonFaceIdApp(GStreamerApp):
             if known_global_id is not None:
                 known_label = self.track_to_label.get(matched_person_track_id, known_global_id)
                 self._add_identity_classification(
-                    detection,
-                    known_label,
-                    1.0,
-                    self.face_tracker_name,
-                    face_track_id,
-                )
-                self._add_identity_classification(
                     matched_person,
-                    known_global_id,
+                    known_label,
                     1.0,
                     self.person_tracker_name,
                     matched_person_track_id,
                 )
                 stats["known"] += 1
                 if frame is not None and self.debug_face_overlay:
-                    self._draw_detection(frame, detection, width, height, known_label)
-                    self._draw_detection(frame, matched_person, width, height, known_global_id)
+                    self._draw_detection(frame, detection, width, height, "face")
+                    self._draw_detection(frame, matched_person, width, height, known_label)
                     user_data.set_frame(frame)
                 self._print_identity(
                     matched_person_track_id,
@@ -872,7 +844,7 @@ class PersonFaceIdApp(GStreamerApp):
                 continue
 
             bbox = detection.get_bbox()
-            logger.info(
+            logger.debug(
                 "Face candidate: frame=%d track_id=%d conf=%.2f bbox=(%.3f, %.3f, %.3f, %.3f)",
                 frame_number,
                 face_track_id,
@@ -887,26 +859,18 @@ class PersonFaceIdApp(GStreamerApp):
             if person["label"] != "Unknown":
                 self.track_to_global_id[matched_person_track_id] = person["global_id"]
                 self.track_to_label[matched_person_track_id] = person["label"]
-                self.person_track_to_global_id[matched_person_track_id] = person["global_id"]
                 self.pending_unknowns.pop(matched_person_track_id, None)
                 self._add_identity_classification(
-                    detection,
-                    person["label"],
-                    confidence,
-                    self.face_tracker_name,
-                    face_track_id,
-                )
-                self._add_identity_classification(
                     matched_person,
-                    person["global_id"],
+                    person["label"],
                     confidence,
                     self.person_tracker_name,
                     matched_person_track_id,
                 )
                 stats["known"] += 1
                 if frame is not None and self.debug_face_overlay:
-                    self._draw_detection(frame, detection, width, height, person["label"])
-                    self._draw_detection(frame, matched_person, width, height, person["global_id"])
+                    self._draw_detection(frame, detection, width, height, "face")
+                    self._draw_detection(frame, matched_person, width, height, person["label"])
                     user_data.set_frame(frame)
                 self._print_identity(
                     matched_person_track_id,
@@ -922,13 +886,12 @@ class PersonFaceIdApp(GStreamerApp):
                 frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height)
 
             if self.debug_face_overlay:
-                self._draw_detection(frame, detection, width, height, "Unknown")
-                self._draw_detection(frame, matched_person, width, height, "person")
+                self._draw_detection(frame, detection, width, height, "face")
+                self._draw_detection(frame, matched_person, width, height, "Unknown")
                 user_data.set_frame(frame)
 
             self._handle_unknown_person(
                 matched_person_track_id,
-                face_track_id,
                 frame_number,
                 frame,
                 detection,
