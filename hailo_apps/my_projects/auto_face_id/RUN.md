@@ -6,8 +6,10 @@ This guide is for the combined `person -> face` prototype.
 
 - tracks only `person`
 - finds a face inside each tracked person ROI
+- removes non-`person` detections from the final ROI before display
 - recognizes known faces
 - enrolls unknown faces and assigns a `global_id`
+- keeps `global_id` on the person box, not on the face box
 
 ## Video Stream
 

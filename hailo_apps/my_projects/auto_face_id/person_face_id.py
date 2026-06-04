@@ -12,6 +12,7 @@ from pathlib import Path
 import gi
 import hailo
 import numpy as np
+from hailo import HailoTracker
 
 gi.require_version("Gst", "1.0")
 from gi.repository import Gst
@@ -101,7 +102,7 @@ class PersonFaceIdData(app_callback_class):
 
 
 class PersonFaceIdApp(GStreamerApp):
-    """Detect persons, then detect and recognize faces inside each person crop."""
+    """Detect persons, then use faces inside person ROIs for recognition."""
 
     def __init__(self, user_data, parser: argparse.ArgumentParser | None = None):
         parser = parser or self._build_parser()
@@ -120,6 +121,9 @@ class PersonFaceIdApp(GStreamerApp):
         self.person_class_id = self.options_menu.person_class_id
         self.debug_face_overlay = self.options_menu.use_frame
         self._shutdown_started = False
+        self.face_tracker_name = "hailo_face_tracker"
+        self.person_tracker_name = "person_tracker"
+        self.tracker = HailoTracker.get_instance()
 
         DATABASE_DIR.mkdir(parents=True, exist_ok=True)
         SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
@@ -215,18 +219,22 @@ class PersonFaceIdApp(GStreamerApp):
         )
 
         self.pending_unknowns: dict[int, PendingIdentity] = {}
+        self.face_track_embeddings: dict[int, np.ndarray] = {}
         self.track_to_global_id: dict[int, str] = {}
         self.person_track_to_global_id: dict[int, str] = {}
         self.track_to_label: dict[int, str] = {}
         self.last_printed_identity: dict[int, str] = {}
+        self.recognition_stats = self._new_recognition_stats()
         self.next_person_index = self._load_next_person_index()
 
         self.app_callback = self.pipeline_callback
 
         logger.info("Person-face database: %s", self.database_dir / DB_NAME)
         logger.info("Person-face samples: %s", self.samples_dir)
+        logger.info("Person-face database records: %d", len(self.db_handler.get_all_records()))
 
         self.create_pipeline()
+        self._connect_face_embedding_callback()
 
     @staticmethod
     def _build_parser() -> argparse.ArgumentParser:
@@ -249,8 +257,8 @@ class PersonFaceIdApp(GStreamerApp):
         parser.add_argument(
             "--person-class-id",
             type=int,
-            default=0,
-            help="Class ID to track as person. Default is 0.",
+            default=1,
+            help="Class ID to track as person. Default is 1 for the Hailo detection post-process.",
         )
         parser.add_argument(
             "--samples-per-person",
@@ -292,18 +300,89 @@ class PersonFaceIdApp(GStreamerApp):
         self.next_person_index += 1
         return label
 
-    def _add_identity_classification(self, detection, label: str, confidence: float) -> None:
+    @staticmethod
+    def _new_recognition_stats() -> dict[str, int]:
+        return {
+            "frames": 0,
+            "persons": 0,
+            "faces": 0,
+            "matched": 0,
+            "embeddings": 0,
+            "known": 0,
+            "unknown": 0,
+            "no_face_track": 0,
+            "no_person_match": 0,
+            "no_person_track": 0,
+            "no_embedding": 0,
+            "multiple_embeddings": 0,
+            "branch_embeddings": 0,
+            "branch_no_embedding": 0,
+        }
+
+    @staticmethod
+    def _get_track_id(detection) -> int | None:
+        if detection is None:
+            return None
+        track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
+        if not track:
+            return None
+        return track[0].get_id()
+
+    def _add_identity_classification(
+        self,
+        detection,
+        label: str,
+        confidence: float,
+        tracker_name: str | None = None,
+        track_id: int | None = None,
+    ) -> None:
         classifications = detection.get_objects_typed(hailo.HAILO_CLASSIFICATION)
         for classification in classifications:
-            detection.remove_object(classification)
+            if classification.get_classification_type() == "face_recon":
+                detection.remove_object(classification)
 
-        detection.add_object(
-            hailo.HailoClassification(
-                type="face_recon",
-                label=label,
-                confidence=confidence,
-            )
+        new_classification = hailo.HailoClassification(
+            type="face_recon",
+            label=label,
+            confidence=confidence,
         )
+        detection.add_object(new_classification)
+
+        if tracker_name is None or track_id is None:
+            return
+
+        self.tracker.remove_classifications_from_track(tracker_name, track_id, "face_recon")
+        self.tracker.add_object_to_track(tracker_name, track_id, new_classification)
+
+    def _log_recognition_stats(self, frame_number: int) -> None:
+        stats = self.recognition_stats
+        if stats["frames"] < 30:
+            return
+
+        logger.info(
+            "Recognition stats through frame %d: frames=%d persons=%d faces=%d "
+            "matched=%d embeddings=%d known=%d unknown=%d no_face_track=%d "
+            "no_person_match=%d no_person_track=%d no_embedding=%d multiple_embeddings=%d",
+            frame_number,
+            stats["frames"],
+            stats["persons"],
+            stats["faces"],
+            stats["matched"],
+            stats["embeddings"],
+            stats["known"],
+            stats["unknown"],
+            stats["no_face_track"],
+            stats["no_person_match"],
+            stats["no_person_track"],
+            stats["no_embedding"],
+            stats["multiple_embeddings"],
+        )
+        logger.info(
+            "Face embedding callback stats: embeddings=%d no_embedding=%d",
+            stats["branch_embeddings"],
+            stats["branch_no_embedding"],
+        )
+        self.recognition_stats = self._new_recognition_stats()
 
     def _print_identity(
         self,
@@ -328,6 +407,46 @@ class PersonFaceIdApp(GStreamerApp):
             return
         self._shutdown_started = True
         super().shutdown(signum, frame)
+
+    def _connect_face_embedding_callback(self) -> None:
+        identity = self.pipeline.get_by_name("face_embedding_callback")
+        if identity is None:
+            logger.warning("face_embedding_callback not found in pipeline")
+            return
+
+        identity_pad = identity.get_static_pad("src")
+        identity_pad.add_probe(Gst.PadProbeType.BUFFER, self.face_embedding_callback)
+
+    def _on_pipeline_rebuilt(self) -> None:
+        self.face_track_embeddings.clear()
+        self._connect_face_embedding_callback()
+
+    def face_embedding_callback(self, pad, info):
+        buffer = info.get_buffer()
+        if buffer is None:
+            return Gst.PadProbeReturn.OK
+
+        roi = hailo.get_roi_from_buffer(buffer)
+        for detection in (
+            detection
+            for detection in roi.get_objects_typed(hailo.HAILO_DETECTION)
+            if detection.get_label() == "face"
+        ):
+            face_track_id = self._get_track_id(detection)
+            if face_track_id is None:
+                continue
+
+            embeddings = detection.get_objects_typed(hailo.HAILO_MATRIX)
+            if not embeddings:
+                self.recognition_stats["branch_no_embedding"] += 1
+                continue
+
+            self.face_track_embeddings[face_track_id] = np.array(embeddings[0].get_data())
+            self.recognition_stats["branch_embeddings"] += 1
+            for embedding in embeddings:
+                detection.remove_object(embedding)
+
+        return Gst.PadProbeReturn.OK
 
     @staticmethod
     def _draw_detection(frame: np.ndarray, detection, width: int, height: int, label: str) -> None:
@@ -373,24 +492,54 @@ class PersonFaceIdApp(GStreamerApp):
         px, py = point
         return x1 <= px <= x2 and y1 <= py <= y2
 
+    @staticmethod
+    def _bbox_area(box: tuple[int, int, int, int]) -> int:
+        x1, y1, x2, y2 = box
+        return max(0, x2 - x1) * max(0, y2 - y1)
+
+    @staticmethod
+    def _intersection_area(a: tuple[int, int, int, int], b: tuple[int, int, int, int]) -> int:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        x1 = max(ax1, bx1)
+        y1 = max(ay1, by1)
+        x2 = min(ax2, bx2)
+        y2 = min(ay2, by2)
+        return max(0, x2 - x1) * max(0, y2 - y1)
+
     def _find_person_for_face(self, face_detection, person_detections, width: int, height: int):
         face_x1, face_y1, face_x2, face_y2 = self._bbox_to_pixels(face_detection, width, height)
         face_center = ((face_x1 + face_x2) // 2, (face_y1 + face_y2) // 2)
+        face_box = (face_x1, face_y1, face_x2, face_y2)
 
         best_person = None
-        best_area = None
+        best_score = None
         for person in person_detections:
             if person.get_label() != "person":
                 continue
             person_box = self._bbox_to_pixels(person, width, height)
             if not self._box_contains_point(person_box, face_center):
                 continue
-            area = max(0, person_box[2] - person_box[0]) * max(0, person_box[3] - person_box[1])
-            if best_person is None or area < best_area:
+            overlap_ratio = self._intersection_area(face_box, person_box) / max(1, self._bbox_area(face_box))
+            if overlap_ratio < 0.25:
+                continue
+            area = self._bbox_area(person_box)
+            score = (overlap_ratio, -area)
+            if best_person is None or score > best_score:
                 best_person = person
-                best_area = area
+                best_score = score
 
         return best_person
+
+    @staticmethod
+    def _prune_non_person_detections(roi) -> int:
+        removed = 0
+        for detection in list(roi.get_objects_typed(hailo.HAILO_DETECTION)):
+            label = detection.get_label()
+            if label not in {"person", "face"}:
+                roi.remove_object(detection)
+                removed += 1
+        return removed
 
     def save_image_file(self, frame, image_path):
         image = Image.fromarray(frame)
@@ -417,13 +566,15 @@ class PersonFaceIdApp(GStreamerApp):
 
     def _recognize_embedding(self, embedding_vector: np.ndarray) -> tuple[dict, float]:
         person = self.db_handler.search_record(embedding=embedding_vector)
-        confidence = 1 - person["_distance"]
+        confidence = 0.0 if person["label"] == "Unknown" else 1 - person["_distance"]
         return person, confidence
 
     def _enroll_if_ready(
         self,
         track_id: int,
-        detection,
+        face_track_id: int,
+        face_detection,
+        person_detection,
     ) -> None:
         pending = self.pending_unknowns.get(track_id)
         if pending is None or len(pending.samples) < self.samples_per_person:
@@ -434,7 +585,20 @@ class PersonFaceIdApp(GStreamerApp):
         if person["label"] != "Unknown":
             self.track_to_global_id[track_id] = person["global_id"]
             self.track_to_label[track_id] = person["label"]
-            self._add_identity_classification(detection, person["label"], confidence)
+            self._add_identity_classification(
+                face_detection,
+                person["label"],
+                confidence,
+                self.face_tracker_name,
+                face_track_id,
+            )
+            self._add_identity_classification(
+                person_detection,
+                person["global_id"],
+                confidence,
+                self.person_tracker_name,
+                track_id,
+            )
             self._print_identity(
                 track_id,
                 person["global_id"],
@@ -466,21 +630,36 @@ class PersonFaceIdApp(GStreamerApp):
 
         self.track_to_global_id[track_id] = new_person["global_id"]
         self.track_to_label[track_id] = label
-        self._add_identity_classification(detection, label, 1.0)
+        self._add_identity_classification(
+            face_detection,
+            label,
+            1.0,
+            self.face_tracker_name,
+            face_track_id,
+        )
+        self._add_identity_classification(
+            person_detection,
+            new_person["global_id"],
+            1.0,
+            self.person_tracker_name,
+            track_id,
+        )
         self._print_identity(track_id, new_person["global_id"], label, 1.0, "enrolled")
         self.pending_unknowns.pop(track_id, None)
 
-    def _handle_unknown_face(
+    def _handle_unknown_person(
         self,
         track_id: int,
+        face_track_id: int,
         frame_number: int,
         frame: np.ndarray,
-        detection,
+        face_detection,
+        person_detection,
         embedding_vector: np.ndarray,
         width: int,
         height: int,
     ) -> None:
-        detection_confidence = detection.get_confidence()
+        detection_confidence = face_detection.get_confidence()
         if detection_confidence < self.min_enroll_confidence:
             return
 
@@ -491,7 +670,7 @@ class PersonFaceIdApp(GStreamerApp):
         ):
             return
 
-        image_path = self._save_face_sample(frame, detection, width, height)
+        image_path = self._save_face_sample(frame, face_detection, width, height)
         pending.samples.append(
             PendingSample(
                 embedding=embedding_vector,
@@ -505,7 +684,7 @@ class PersonFaceIdApp(GStreamerApp):
             f"collecting: track_id={track_id} samples="
             f"{len(pending.samples)}/{self.samples_per_person}"
         )
-        self._enroll_if_ready(track_id, detection)
+        self._enroll_if_ready(track_id, face_track_id, face_detection, person_detection)
 
     def get_pipeline_string(self):
         source_pipeline = self.get_source_pipeline()
@@ -541,12 +720,8 @@ class PersonFaceIdApp(GStreamerApp):
             post_function_name=self.face_detection_func,
             batch_size=self.batch_size,
             config_json=self.face_labels_json,
-            name="face_detection",
         )
-        face_detection_wrapper = INFERENCE_PIPELINE_WRAPPER(
-            face_detection_pipeline,
-            name="face_detection_wrapper",
-        )
+        face_detection_wrapper = INFERENCE_PIPELINE_WRAPPER(face_detection_pipeline)
         face_tracker_pipeline = TRACKER_PIPELINE(
             class_id=-1,
             kalman_dist_thr=0.7,
@@ -556,7 +731,7 @@ class PersonFaceIdApp(GStreamerApp):
             keep_tracked_frames=6,
             keep_lost_frames=8,
             keep_past_metadata=True,
-            name="face_tracker",
+            name=self.face_tracker_name,
         )
         face_id_pipeline = INFERENCE_PIPELINE(
             hef_path=self.face_recognition_hef_path,
@@ -564,19 +739,18 @@ class PersonFaceIdApp(GStreamerApp):
             post_function_name=self.face_recognition_post_function_name,
             batch_size=self.batch_size,
             config_json=None,
-            name="face_recognition",
+            name="face_recognition_inference",
         )
         face_cropper_pipeline = CROPPER_PIPELINE(
             inner_pipeline=(
                 f'hailofilter so-path={self.face_align_post_process_so} '
                 f'name=face_align_hailofilter use-gst-buffer=true qos=false ! '
-                f'{QUEUE(name="face_align_q")} ! '
+                f'{QUEUE(name="detector_pos_face_align_q")} ! '
                 f'{face_id_pipeline}'
             ),
             so_path=self.face_cropper_post_process_so,
             function_name=self.face_cropper_function_name,
             internal_offset=True,
-            name="face_cropper",
         )
 
         display_pipeline = DISPLAY_PIPELINE(
@@ -586,18 +760,13 @@ class PersonFaceIdApp(GStreamerApp):
         )
 
         return (
-            f"{source_pipeline} ! tee name=split "
-            f"hailomuxer name=mux "
-            f"split. ! {QUEUE(name='person_branch_q')} ! "
-            f"{person_detection_wrapper} ! "
-            f"{person_tracker_pipeline} ! "
-            f"mux.sink_0 "
-            f"split. ! {QUEUE(name='face_branch_q')} ! "
+            f"{source_pipeline} ! "
             f"{face_detection_wrapper} ! "
             f"{face_tracker_pipeline} ! "
             f"{face_cropper_pipeline} ! "
-            f"mux.sink_1 "
-            f"mux. ! "
+            f"{USER_CALLBACK_PIPELINE(name='face_embedding_callback')} ! "
+            f"{person_detection_wrapper} ! "
+            f"{person_tracker_pipeline} ! "
             f"{USER_CALLBACK_PIPELINE(name='identity_callback')} ! "
             f"{display_pipeline}"
         )
@@ -608,47 +777,105 @@ class PersonFaceIdApp(GStreamerApp):
             return
 
         roi = hailo.get_roi_from_buffer(buffer)
+        removed_detections = self._prune_non_person_detections(roi)
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
         face_detections = [d for d in detections if d.get_label() == "face"]
         person_detections = [d for d in detections if d.get_label() == "person"]
+
+        for person_detection in person_detections:
+            person_track_id = self._get_track_id(person_detection)
+            if person_track_id is None:
+                continue
+            global_id = self.track_to_global_id.get(person_track_id)
+            if global_id is None:
+                continue
+            self._add_identity_classification(
+                person_detection,
+                global_id,
+                1.0,
+                self.person_tracker_name,
+                person_track_id,
+            )
+            self.person_track_to_global_id[person_track_id] = global_id
 
         pad = element.get_static_pad("src")
         fmt, width, height = get_caps_from_pad(pad)
         frame_number = user_data.get_count()
         frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height) if self.debug_face_overlay else None
 
-        if face_detections:
-            logger.info(
-                "Detections on frame %d: persons=%d faces=%d",
-                frame_number,
-                len(person_detections),
-                len(face_detections),
-            )
-        elif frame_number % 30 == 0:
-            logger.info("No face detections on frame %d", frame_number)
+        stats = self.recognition_stats
+        stats["frames"] += 1
+        stats["persons"] += len(person_detections)
+        stats["faces"] += len(face_detections)
+        if removed_detections:
+            logger.debug("Removed %d non-person/non-face detections on frame %d", removed_detections, frame_number)
 
         for detection in face_detections:
             matched_person = self._find_person_for_face(detection, person_detections, width, height)
+            face_track_id = self._get_track_id(detection)
+            if face_track_id is None:
+                stats["no_face_track"] += 1
+                continue
+            embedding_vector = self.face_track_embeddings.pop(face_track_id, None)
+
             if matched_person is None:
+                stats["no_person_match"] += 1
                 continue
 
-            track = detection.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-            if not track:
+            matched_person_track_id = self._get_track_id(matched_person)
+            if matched_person_track_id is None:
+                stats["no_person_track"] += 1
                 continue
+            stats["matched"] += 1
 
-            track_id = track[0].get_id()
-            embedding = detection.get_objects_typed(hailo.HAILO_MATRIX)
-            if len(embedding) != 1:
+            if embedding_vector is None:
+                embeddings = detection.get_objects_typed(hailo.HAILO_MATRIX)
+                if not embeddings:
+                    stats["no_embedding"] += 1
+                    continue
+                if len(embeddings) > 1:
+                    stats["multiple_embeddings"] += 1
+                embedding_vector = np.array(embeddings[0].get_data())
+                for embedding in embeddings:
+                    detection.remove_object(embedding)
+            stats["embeddings"] += 1
+
+            known_global_id = self.track_to_global_id.get(matched_person_track_id)
+            if known_global_id is not None:
+                known_label = self.track_to_label.get(matched_person_track_id, known_global_id)
+                self._add_identity_classification(
+                    detection,
+                    known_label,
+                    1.0,
+                    self.face_tracker_name,
+                    face_track_id,
+                )
+                self._add_identity_classification(
+                    matched_person,
+                    known_global_id,
+                    1.0,
+                    self.person_tracker_name,
+                    matched_person_track_id,
+                )
+                stats["known"] += 1
+                if frame is not None and self.debug_face_overlay:
+                    self._draw_detection(frame, detection, width, height, known_label)
+                    self._draw_detection(frame, matched_person, width, height, known_global_id)
+                    user_data.set_frame(frame)
+                self._print_identity(
+                    matched_person_track_id,
+                    known_global_id,
+                    known_label,
+                    1.0,
+                    "recognized",
+                )
                 continue
-
-            embedding_vector = np.array(embedding[0].get_data())
-            detection.remove_object(embedding[0])
 
             bbox = detection.get_bbox()
             logger.info(
                 "Face candidate: frame=%d track_id=%d conf=%.2f bbox=(%.3f, %.3f, %.3f, %.3f)",
                 frame_number,
-                track_id,
+                face_track_id,
                 detection.get_confidence(),
                 bbox.xmin(),
                 bbox.ymin(),
@@ -658,44 +885,60 @@ class PersonFaceIdApp(GStreamerApp):
 
             person, confidence = self._recognize_embedding(embedding_vector)
             if person["label"] != "Unknown":
-                self.track_to_global_id[track_id] = person["global_id"]
-                self.track_to_label[track_id] = person["label"]
-                self.pending_unknowns.pop(track_id, None)
-                self._add_identity_classification(detection, person["label"], confidence)
-                self._add_identity_classification(matched_person, person["label"], confidence)
-                matched_person_track = matched_person.get_objects_typed(hailo.HAILO_UNIQUE_ID)
-                if matched_person_track:
-                    self.person_track_to_global_id[matched_person_track[0].get_id()] = person["global_id"]
+                self.track_to_global_id[matched_person_track_id] = person["global_id"]
+                self.track_to_label[matched_person_track_id] = person["label"]
+                self.person_track_to_global_id[matched_person_track_id] = person["global_id"]
+                self.pending_unknowns.pop(matched_person_track_id, None)
+                self._add_identity_classification(
+                    detection,
+                    person["label"],
+                    confidence,
+                    self.face_tracker_name,
+                    face_track_id,
+                )
+                self._add_identity_classification(
+                    matched_person,
+                    person["global_id"],
+                    confidence,
+                    self.person_tracker_name,
+                    matched_person_track_id,
+                )
+                stats["known"] += 1
                 if frame is not None and self.debug_face_overlay:
-                    self._draw_detection(frame, detection, width, height, "face")
+                    self._draw_detection(frame, detection, width, height, person["label"])
+                    self._draw_detection(frame, matched_person, width, height, person["global_id"])
+                    user_data.set_frame(frame)
                 self._print_identity(
-                    track_id,
+                    matched_person_track_id,
                     person["global_id"],
                     person["label"],
                     confidence,
                     "recognized",
                 )
-                if frame is not None and self.debug_face_overlay:
-                    user_data.set_frame(frame)
                 continue
 
+            stats["unknown"] += 1
             if frame is None:
                 frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height)
 
             if self.debug_face_overlay:
-                self._draw_detection(frame, detection, width, height, "face")
+                self._draw_detection(frame, detection, width, height, "Unknown")
+                self._draw_detection(frame, matched_person, width, height, "person")
                 user_data.set_frame(frame)
 
-            self._handle_unknown_face(
-                track_id,
+            self._handle_unknown_person(
+                matched_person_track_id,
+                face_track_id,
                 frame_number,
                 frame,
                 detection,
+                matched_person,
                 embedding_vector,
                 width,
                 height,
             )
 
+        self._log_recognition_stats(frame_number)
         return Gst.FlowReturn.OK
 
 

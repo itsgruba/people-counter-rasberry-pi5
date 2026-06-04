@@ -10,7 +10,8 @@ Current working plan: [PLAN.md](./PLAN.md)
 
 The new combined pipeline entrypoint is [person_face_id.py](./person_face_id.py).
 It runs `person` detection/tracking and face detection/recognition in parallel on Hailo,
-then merges the results so the main display shows both person and face boxes.
+then uses the face only as a signal to recognize the person track.
+The visual identity is attached to the `person` box, which is the source of truth.
 
 ## Run Guide
 
@@ -24,6 +25,8 @@ This app uses the existing Hailo face-recognition pipeline:
 
 New faces are enrolled automatically from live video. The tracker `track_id` is temporary, but
 the printed `global_id` is persistent across disappear/reappear events when recognition matches.
+If a face cannot be matched confidently to a person ROI, the app waits instead of assigning an ID
+too early.
 
 ## Run
 
