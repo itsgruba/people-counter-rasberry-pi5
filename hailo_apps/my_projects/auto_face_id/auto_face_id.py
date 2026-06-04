@@ -20,21 +20,20 @@ from hailo_apps.python.core.common.buffer_utils import (
     get_caps_from_pad,
     get_numpy_from_buffer_efficient,
 )
-from hailo_apps.python.core.common.db_handler import DatabaseHandler, Record
 from hailo_apps.python.core.common.hailo_logger import get_logger
 from hailo_apps.python.core.common.parser import get_pipeline_parser
 from hailo_apps.python.core.gstreamer.gstreamer_app import app_callback_class
 from hailo_apps.python.pipeline_apps.face_recognition.face_recognition_pipeline import (
     GStreamerFaceRecognitionApp,
 )
+from hailo_apps.my_projects.auto_face_id.sqlite_db_handler import SQLiteDatabaseHandler
 
 logger = get_logger(__name__)
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DATABASE_DIR = PROJECT_DIR / "database"
 SAMPLES_DIR = PROJECT_DIR / "samples"
-DB_NAME = "persons.db"
-TABLE_NAME = "persons"
+DB_NAME = "persons.sqlite3"
 
 
 @dataclass
@@ -79,10 +78,8 @@ class AutoFaceIdApp(GStreamerFaceRecognitionApp):
         SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
         self.database_dir = DATABASE_DIR
         self.samples_dir = SAMPLES_DIR
-        self.db_handler = DatabaseHandler(
+        self.db_handler = SQLiteDatabaseHandler(
             db_name=DB_NAME,
-            table_name=TABLE_NAME,
-            schema=Record,
             threshold=self.lance_db_vector_search_classificaiton_confidence_threshold,
             database_dir=str(self.database_dir),
             samples_dir=str(self.samples_dir),

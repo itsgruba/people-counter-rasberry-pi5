@@ -2,6 +2,9 @@
 
 Automatic face enrollment and recognition for Hailo Apps.
 
+The project uses a local SQLite database for identities and NumPy cosine similarity for
+face embedding search.
+
 ## Plan
 
 Current working plan: [PLAN.md](./PLAN.md)
@@ -21,7 +24,7 @@ This app uses the existing Hailo face-recognition pipeline:
 
 - SCRFD for face detection
 - ArcFace MobileFaceNet for face embeddings
-- LanceDB for persistent `global_id` lookup
+- SQLite for persistent people, embeddings, and sample paths
 
 New faces are enrolled automatically from live video. The tracker `track_id` is temporary, but
 the printed `global_id` is persistent across disappear/reappear events when recognition matches.
@@ -40,7 +43,7 @@ From the repository root:
 
 ```bash
 source setup_env.sh
-python3 my_projects/auto_face_id/person_face_id.py \
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --input http://172.20.10.13:81/stream \
   --width 320 \
   --height 240 \
@@ -53,12 +56,46 @@ python3 my_projects/auto_face_id/person_face_id.py \
 The app stores its own database and samples under:
 
 ```text
-my_projects/auto_face_id/database/
-my_projects/auto_face_id/samples/
+hailo_apps/my_projects/auto_face_id/database/persons.sqlite3
+hailo_apps/my_projects/auto_face_id/samples/
 ```
 
 It does not use or modify the standard `hailo_apps/python/pipeline_apps/face_recognition`
-database.
+database. The old project-local LanceDB folder `database/persons.db/` is no longer used after
+migration.
+
+To migrate an existing project-local LanceDB again, run:
+
+```bash
+venv_hailo_apps/bin/python hailo_apps/my_projects/auto_face_id/migrate_lancedb_to_sqlite.py
+```
+
+## Inspect SQLite
+
+Open `database/persons.sqlite3` in VS Code with a SQLite viewer extension, or run:
+
+```bash
+python3 hailo_apps/my_projects/auto_face_id/inspect_database.py
+```
+
+The database contains:
+
+- `persons`: one row per known person
+- `face_samples`: one row per face embedding and JPEG sample
+
+Useful SQL queries:
+
+```sql
+SELECT COUNT(*) FROM persons;
+
+SELECT id, label, global_id FROM persons ORDER BY id;
+
+SELECT persons.label, COUNT(face_samples.id) AS samples
+FROM persons
+LEFT JOIN face_samples ON face_samples.person_id = persons.id
+GROUP BY persons.id
+ORDER BY persons.id;
+```
 
 Default resources are resolved automatically for:
 

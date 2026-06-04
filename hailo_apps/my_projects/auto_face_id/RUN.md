@@ -26,7 +26,7 @@ From the repository root:
 
 ```bash
 source setup_env.sh
-python3 my_projects/auto_face_id/person_face_id.py \
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --input http://172.20.10.13:81/stream \
   --width 320 \
   --height 240 \
@@ -43,8 +43,9 @@ python3 my_projects/auto_face_id/person_face_id.py \
 - The app stores its database and samples in:
 
 ```text
-my_projects/auto_face_id/database/
-my_projects/auto_face_id/samples/
+hailo_apps/my_projects/auto_face_id/database/persons.sqlite3
+hailo_apps/my_projects/auto_face_id/samples/
 ```
 
 - The default resources for person detection, face detection, and face recognition are resolved automatically by the app.
+- Inspect the current people with `python3 hailo_apps/my_projects/auto_face_id/inspect_database.py`.
