@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 import urllib.error
 import urllib.request
@@ -75,6 +76,16 @@ PROJECT_DIR = Path(__file__).resolve().parent
 DATABASE_DIR = PROJECT_DIR / "database"
 SAMPLES_DIR = PROJECT_DIR / "samples"
 DB_NAME = "persons.sqlite3"
+DEFAULT_PIPELINE_LATENCY_MS = 50
+DEFAULT_LOW_LATENCY_QUEUE_SIZE = 1
+
+QUEUE_PATTERN = re.compile(
+    r"queue name=(?P<name>\S+) "
+    r"leaky=(?P<leaky>\S+) "
+    r"max-size-buffers=(?P<buffers>\d+) "
+    r"max-size-bytes=(?P<bytes>\d+) "
+    r"max-size-time=(?P<time>\d+)"
+)
 
 
 @dataclass
@@ -123,6 +134,9 @@ class PersonFaceIdApp(GStreamerApp):
         self.notify_url = self.options_menu.notify_url
         self.person_class_id = self.options_menu.person_class_id
         self.debug_face_overlay = self.options_menu.use_frame
+        self.low_latency_enabled = not self.options_menu.disable_low_latency
+        self.low_latency_queue_size = max(1, self.options_menu.low_latency_queue_size)
+        self.pipeline_latency = max(0, self.options_menu.pipeline_latency_ms)
         self._shutdown_started = False
         self.face_tracker_name = "hailo_face_tracker"
         self.person_tracker_name = "person_tracker"
@@ -289,6 +303,32 @@ class PersonFaceIdApp(GStreamerApp):
             help=(
                 "Optional HTTP endpoint that receives JSON notifications when a person is "
                 "recognized or enrolled."
+            ),
+        )
+        parser.add_argument(
+            "--disable-low-latency",
+            action="store_true",
+            help=(
+                "Keep the default Hailo queue buffering behavior. By default this app "
+                "uses shallow live-video queues to avoid multi-second camera delay."
+            ),
+        )
+        parser.add_argument(
+            "--low-latency-queue-size",
+            type=int,
+            default=DEFAULT_LOW_LATENCY_QUEUE_SIZE,
+            help=(
+                "Maximum buffers kept in each GStreamer queue while low-latency mode is enabled. "
+                "Default is 1, which favors fresh live frames over smooth backlog playback."
+            ),
+        )
+        parser.add_argument(
+            "--pipeline-latency-ms",
+            type=int,
+            default=DEFAULT_PIPELINE_LATENCY_MS,
+            help=(
+                "Pipeline latency in milliseconds. Lower values reduce live stream lag; "
+                "increase this if the display becomes unstable."
             ),
         )
         return parser
@@ -738,8 +778,50 @@ class PersonFaceIdApp(GStreamerApp):
         )
         self._enroll_if_ready(track_id, person_detection)
 
+    @staticmethod
+    def _is_pairing_sensitive_queue(queue_name: str) -> bool:
+        """Queues inside cropper/aggregator branches should not drop one side of a frame pair."""
+        if queue_name.endswith("_bypass_q"):
+            return True
+        if queue_name == "detector_pos_face_align_q":
+            return True
+        if queue_name.startswith("face_recognition_inference_"):
+            return True
+        if (
+            queue_name.startswith("person_detection_")
+            and not queue_name.startswith("person_detection_wrapper_")
+        ):
+            return True
+        if (
+            queue_name.startswith("inference_")
+            and not queue_name.startswith("inference_wrapper_")
+        ):
+            return True
+        return False
+
+    def _low_latency_queue_config(self, match: re.Match) -> str:
+        queue_name = match.group("name")
+        leaky = "no" if self._is_pairing_sensitive_queue(queue_name) else "downstream"
+        return (
+            f"queue name={queue_name} "
+            f"leaky={leaky} "
+            f"max-size-buffers={self.low_latency_queue_size} "
+            "max-size-bytes=0 "
+            "max-size-time=0"
+        )
+
+    def _apply_low_latency_queue_policy(self, pipeline_string: str) -> str:
+        if not self.low_latency_enabled:
+            return pipeline_string
+        return QUEUE_PATTERN.sub(self._low_latency_queue_config, pipeline_string)
+
     def get_pipeline_string(self):
-        source_pipeline = self.get_source_pipeline()
+        source_kwargs = {}
+        if self.frame_rate is not None:
+            # The shared helper only emits framerate caps when its sync flag is true.
+            # For live HTTP cameras we still want --frame-rate to throttle input.
+            source_kwargs["sync"] = True
+        source_pipeline = self.get_source_pipeline(**source_kwargs)
 
         person_detection_pipeline = INFERENCE_PIPELINE(
             hef_path=self.person_hef_path,
@@ -811,7 +893,7 @@ class PersonFaceIdApp(GStreamerApp):
             show_fps=self.show_fps,
         )
 
-        return (
+        pipeline_string = (
             f"{source_pipeline} ! "
             f"{face_detection_wrapper} ! "
             f"{face_tracker_pipeline} ! "
@@ -822,6 +904,7 @@ class PersonFaceIdApp(GStreamerApp):
             f"{USER_CALLBACK_PIPELINE(name='identity_callback')} ! "
             f"{display_pipeline}"
         )
+        return self._apply_low_latency_queue_policy(pipeline_string)
 
     def pipeline_callback(self, element, buffer, user_data):
         if buffer is None:

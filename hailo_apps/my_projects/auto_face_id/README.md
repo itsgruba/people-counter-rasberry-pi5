@@ -56,6 +56,13 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --height 240 \
   --disable-sync \
   --show-fps
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --input http://192.168.8.14:8080/stream \
+  --width 320 \
+  --height 240 \
+  --disable-sync \
+  --show-fps
 ```
 
 ## Storage
