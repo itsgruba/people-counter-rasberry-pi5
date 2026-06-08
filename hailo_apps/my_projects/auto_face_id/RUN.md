@@ -47,5 +47,11 @@ hailo_apps/my_projects/auto_face_id/database/persons.sqlite3
 hailo_apps/my_projects/auto_face_id/samples/
 ```
 
+- Start the FastAPI backend with:
+
+```bash
+uvicorn hailo_apps.my_projects.auto_face_id.person_face_api:app --host 127.0.0.1 --port 8000
+```
+
 - The default resources for person detection, face detection, and face recognition are resolved automatically by the app.
 - Inspect the current people with `python3 hailo_apps/my_projects/auto_face_id/inspect_database.py`.

@@ -49,6 +49,13 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --height 240 \
   --disable-sync \
   --show-fps
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --input http://192.168.8.10:81/stream \
+  --width 320 \
+  --height 240 \
+  --disable-sync \
+  --show-fps
 ```
 
 ## Storage
@@ -83,6 +90,55 @@ The database contains:
 - `persons`: one row per known person
 - `face_samples`: one row per face embedding and JPEG sample
 
+## Maintenance CLI
+
+For day-to-day cleanup, use the dedicated maintenance script. It always removes the database
+rows and the matching sample files together, so the SQLite data and `samples/` folder stay in
+sync.
+
+```bash
+python3 hailo_apps/my_projects/auto_face_id/manage_database.py inspect
+python3 hailo_apps/my_projects/auto_face_id/manage_database.py delete-person --label person_1
+python3 hailo_apps/my_projects/auto_face_id/manage_database.py delete-person --global-id <uuid>
+python3 hailo_apps/my_projects/auto_face_id/manage_database.py clear-all
+python3 hailo_apps/my_projects/auto_face_id/manage_database.py prune-samples
+python3 hailo_apps/my_projects/auto_face_id/manage_database.py repair
+```
+
+If the package is installed, the same CLI is available as:
+
+```bash
+hailo-auto-face-db inspect
+```
+
+## Dashboard API
+
+For a small frontend, run the FastAPI backend:
+
+```bash
+uvicorn hailo_apps.my_projects.auto_face_id.person_face_api:app \
+  --host 127.0.0.1 \
+  --port 8000 \
+  --reload
+```
+
+It exposes:
+
+- `GET /api/people` - lightweight карточки людей with `label`, `visit_count`, `thumbnail_url`
+- `GET /api/people/{global_id}` - full record for one person
+- `GET /samples/{filename}` - serves the saved JPEG sample images
+- `POST /api/events` - optional event sink for camera notifications
+
+The frontend can poll `GET /api/people` every few seconds, or you can use
+`--notify-url http://127.0.0.1:8000/api/events` in `person_face_id.py` to push events on
+recognition/enrollment.
+
+The visit counter follows the `track_id` session rule:
+
+- if the same person stays on the same `track_id`, `visit_count` does not change
+- if the person leaves and comes back with a new `track_id`, `visit_count` increases
+- the current `last_seen_track_id` is stored in SQLite so the backend and frontend can stay in sync
+
 Useful SQL queries:
 
 ```sql
@@ -95,6 +151,10 @@ FROM persons
 LEFT JOIN face_samples ON face_samples.person_id = persons.id
 GROUP BY persons.id
 ORDER BY persons.id;
+
+SELECT label, visits_count AS visit_count, last_seen_at, last_seen_track_id
+FROM persons
+ORDER BY id;
 ```
 
 Default resources are resolved automatically for:

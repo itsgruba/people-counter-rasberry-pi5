@@ -40,6 +40,7 @@ class SQLiteDatabaseHandler:
         self._connection.execute("PRAGMA journal_mode = WAL")
         self._connection.execute("PRAGMA synchronous = NORMAL")
         self._create_schema()
+        self._ensure_person_columns()
         self._embedding_cache: dict[str, np.ndarray] = {}
         self._reload_embedding_cache()
 
@@ -55,6 +56,9 @@ class SQLiteDatabaseHandler:
                     last_sample_received_time INTEGER NOT NULL,
                     classification_confidence_threshold REAL NOT NULL,
                     value REAL NOT NULL DEFAULT 0.0,
+                    visits_count INTEGER NOT NULL DEFAULT 0,
+                    last_seen_at INTEGER,
+                    last_seen_track_id INTEGER,
                     created_at INTEGER NOT NULL
                 );
 
@@ -71,6 +75,28 @@ class SQLiteDatabaseHandler:
                 ON face_samples(person_id);
                 """
             )
+
+    def _ensure_person_columns(self) -> None:
+        """Add new columns to older databases without requiring a manual migration."""
+        columns = {
+            row["name"]
+            for row in self._connection.execute("PRAGMA table_info(persons)").fetchall()
+        }
+        migrations = [
+            (
+                "visits_count",
+                "ALTER TABLE persons ADD COLUMN visits_count INTEGER NOT NULL DEFAULT 0",
+            ),
+            ("last_seen_at", "ALTER TABLE persons ADD COLUMN last_seen_at INTEGER"),
+            (
+                "last_seen_track_id",
+                "ALTER TABLE persons ADD COLUMN last_seen_track_id INTEGER",
+            ),
+        ]
+        with self._connection:
+            for column_name, statement in migrations:
+                if column_name not in columns:
+                    self._connection.execute(statement)
 
     @staticmethod
     def _embedding_array(embedding: np.ndarray | list[float]) -> np.ndarray:
@@ -136,7 +162,13 @@ class SQLiteDatabaseHandler:
             "classificaiton_confidence_threshold": row[
                 "classification_confidence_threshold"
             ],
-            "value": row["value"],
+            "visit_count": int(
+                row["visits_count"] if "visits_count" in row.keys() else 0
+            ),
+            "last_seen_at": row["last_seen_at"] if "last_seen_at" in row.keys() else None,
+            "last_seen_track_id": (
+                row["last_seen_track_id"] if "last_seen_track_id" in row.keys() else None
+            ),
         }
         if distance is not None:
             record["_distance"] = distance
@@ -157,11 +189,13 @@ class SQLiteDatabaseHandler:
     def create_record(
         self,
         embedding: np.ndarray,
-        sample: str,
+        sample: str | None,
         timestamp: int,
         label: str = "Unknown",
         global_id: str | None = None,
         threshold: float | None = None,
+        visits_count: int = 1,
+        last_seen_track_id: int | None = None,
     ) -> dict[str, Any]:
         vector = self._embedding_array(embedding)
         global_id = global_id or str(uuid.uuid4())
@@ -179,11 +213,26 @@ class SQLiteDatabaseHandler:
                     avg_embedding,
                     last_sample_received_time,
                     classification_confidence_threshold,
-                    created_at
+                    value,
+                    visits_count,
+                    created_at,
+                    last_seen_at,
+                    last_seen_track_id
                 )
-                VALUES (?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
-                (global_id, label, vector.tobytes(), timestamp, threshold, timestamp),
+                (
+                    global_id,
+                    label,
+                    vector.tobytes(),
+                    timestamp,
+                    threshold,
+                    visits_count,
+                    visits_count,
+                    timestamp,
+                    timestamp,
+                    last_seen_track_id,
+                ),
             )
             self._connection.execute(
                 """
@@ -195,6 +244,59 @@ class SQLiteDatabaseHandler:
             self._embedding_cache[global_id] = vector.copy()
 
         return self.get_record_by_id(global_id)
+
+    def mark_person_seen(
+        self,
+        global_id: str,
+        timestamp: int,
+        track_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Register a visible person and increment the visit counter for a new track."""
+        with self._lock, self._connection:
+            row = self._connection.execute(
+                "SELECT * FROM persons WHERE global_id = ?",
+                (global_id,),
+            ).fetchone()
+            if row is None:
+                return None
+
+            last_track_id = (
+                row["last_seen_track_id"] if "last_seen_track_id" in row.keys() else None
+            )
+            should_increment = track_id is not None and track_id != last_track_id
+
+            if should_increment:
+                self._connection.execute(
+                    """
+                    UPDATE persons
+                    SET visits_count = visits_count + 1,
+                        last_seen_at = ?,
+                        last_seen_track_id = ?
+                    WHERE global_id = ?
+                    """,
+                    (timestamp, track_id, global_id),
+                )
+            else:
+                self._connection.execute(
+                    """
+                    UPDATE persons
+                    SET last_seen_at = ?,
+                        last_seen_track_id = ?
+                    WHERE global_id = ?
+                    """,
+                    (timestamp, track_id, global_id),
+                )
+
+            updated_row = self._connection.execute(
+                "SELECT * FROM persons WHERE global_id = ?",
+                (global_id,),
+            ).fetchone()
+            if updated_row is None:
+                return None
+
+            record = self._row_to_record(updated_row)
+            record["visit_incremented"] = should_increment
+            return record
 
     def insert_new_sample(
         self,
@@ -279,6 +381,27 @@ class SQLiteDatabaseHandler:
             else:
                 rows = self._connection.execute("SELECT * FROM persons ORDER BY id").fetchall()
             return [self._row_to_record(row) for row in rows]
+
+    def get_people_cards(self) -> list[dict[str, Any]]:
+        """Return lightweight person summaries for a frontend dashboard."""
+        cards = []
+        for record in self.get_all_records():
+            thumbnail_path = None
+            if record["samples_json"]:
+                sample_path = record["samples_json"][0]["sample_path"]
+                if sample_path:
+                    thumbnail_path = Path(sample_path).name
+            cards.append(
+                {
+                    "global_id": record["global_id"],
+                    "label": record["label"],
+                    "visit_count": int(record["visit_count"]),
+                    "last_seen_at": record["last_seen_at"],
+                    "thumbnail_name": thumbnail_path,
+                    "sample_count": len(record["samples_json"] or []),
+                }
+            )
+        return cards
 
     def get_record_by_id(self, global_id: str) -> dict[str, Any] | None:
         with self._lock:

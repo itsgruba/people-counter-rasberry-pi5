@@ -4,7 +4,10 @@
 from __future__ import annotations
 
 import argparse
+import json
 import time
+import urllib.error
+import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -117,6 +120,7 @@ class PersonFaceIdApp(GStreamerApp):
         self.unknown_sample_interval = self.options_menu.unknown_sample_interval
         self.min_enroll_confidence = self.options_menu.min_enroll_confidence
         self.print_every_frame = self.options_menu.print_every_frame
+        self.notify_url = self.options_menu.notify_url
         self.person_class_id = self.options_menu.person_class_id
         self.debug_face_overlay = self.options_menu.use_frame
         self._shutdown_started = False
@@ -279,6 +283,14 @@ class PersonFaceIdApp(GStreamerApp):
             action="store_true",
             help="Print known identities every processed callback instead of only on changes.",
         )
+        parser.add_argument(
+            "--notify-url",
+            default=None,
+            help=(
+                "Optional HTTP endpoint that receives JSON notifications when a person is "
+                "recognized or enrolled."
+            ),
+        )
         return parser
 
     def _load_next_person_index(self) -> int:
@@ -396,6 +408,48 @@ class PersonFaceIdApp(GStreamerApp):
             f"{state}: track_id={track_id} global_id={global_id} "
             f"label={label} confidence={confidence:.2f}"
         )
+
+    def _mark_person_seen(self, global_id: str, track_id: int) -> dict | None:
+        """Increment the persisted visit counter when a known person is seen again."""
+        return self.db_handler.mark_person_seen(
+            global_id=global_id,
+            timestamp=int(time.time()),
+            track_id=track_id,
+        )
+
+    def _notify_frontend(
+        self,
+        event: str,
+        global_id: str,
+        label: str,
+        track_id: int,
+        confidence: float,
+        visit_count: int | None = None,
+    ) -> None:
+        """Send a best-effort JSON event to an optional frontend/backend endpoint."""
+        if not self.notify_url:
+            return
+
+        payload = {
+            "event": event,
+            "global_id": global_id,
+            "label": label,
+            "track_id": track_id,
+            "confidence": confidence,
+            "visit_count": visit_count,
+            "timestamp": int(time.time()),
+        }
+        request = urllib.request.Request(
+            self.notify_url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=1.0):
+                pass
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            logger.debug("Failed to notify %s: %s", self.notify_url, exc)
 
     def shutdown(self, signum=None, frame=None):
         """Prevent double shutdown and noisy HailoRT transfer errors on Ctrl-C."""
@@ -579,6 +633,7 @@ class PersonFaceIdApp(GStreamerApp):
         if person["label"] != "Unknown":
             self.track_to_global_id[track_id] = person["global_id"]
             self.track_to_label[track_id] = person["label"]
+            updated_record = self._mark_person_seen(person["global_id"], track_id)
             self._add_identity_classification(
                 person_detection,
                 person["label"],
@@ -593,6 +648,15 @@ class PersonFaceIdApp(GStreamerApp):
                 confidence,
                 "recognized-after-samples",
             )
+            if updated_record and updated_record.get("visit_incremented"):
+                self._notify_frontend(
+                    "recognized",
+                    person["global_id"],
+                    person["label"],
+                    track_id,
+                    confidence,
+                    visit_count=updated_record["visit_count"],
+                )
             self.pending_unknowns.pop(track_id, None)
             return
 
@@ -603,6 +667,7 @@ class PersonFaceIdApp(GStreamerApp):
             sample=best_sample.image_path,
             timestamp=int(time.time()),
             label=label,
+            last_seen_track_id=track_id,
         )
 
         for sample in pending.samples:
@@ -625,6 +690,14 @@ class PersonFaceIdApp(GStreamerApp):
             track_id,
         )
         self._print_identity(track_id, new_person["global_id"], label, 1.0, "enrolled")
+        self._notify_frontend(
+            "enrolled",
+            new_person["global_id"],
+            label,
+            track_id,
+            1.0,
+            visit_count=new_person["visit_count"],
+        )
         self.pending_unknowns.pop(track_id, None)
 
     def _handle_unknown_person(
@@ -856,6 +929,10 @@ class PersonFaceIdApp(GStreamerApp):
             if person["label"] != "Unknown":
                 self.track_to_global_id[matched_person_track_id] = person["global_id"]
                 self.track_to_label[matched_person_track_id] = person["label"]
+                updated_record = self._mark_person_seen(
+                    person["global_id"],
+                    matched_person_track_id,
+                )
                 self.pending_unknowns.pop(matched_person_track_id, None)
                 self._add_identity_classification(
                     matched_person,
@@ -876,6 +953,15 @@ class PersonFaceIdApp(GStreamerApp):
                     confidence,
                     "recognized",
                 )
+                if updated_record and updated_record.get("visit_incremented"):
+                    self._notify_frontend(
+                        "recognized",
+                        person["global_id"],
+                        person["label"],
+                        matched_person_track_id,
+                        confidence,
+                        visit_count=updated_record["visit_count"],
+                    )
                 continue
 
             stats["unknown"] += 1
