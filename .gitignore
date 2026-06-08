@@ -24,6 +24,16 @@ local_resources/piper_models/*.onnx.json
 *.mp3
 *.ogg
 
+# Images
+*.jpg
+*.jpeg
+*.JPG
+*.JPEG
+*.png
+*.gif
+*.bmp
+*.webp
+
 # User-specific audio device preferences
 local_resources/audio_device_preferences.json
 
