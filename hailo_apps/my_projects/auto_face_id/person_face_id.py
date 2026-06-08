@@ -99,11 +99,23 @@ class PendingSample:
 
 
 @dataclass
+class PendingVote:
+    """One recognition vote for an unresolved person track."""
+
+    global_id: str | None
+    label: str | None
+    confidence: float
+    timestamp: int
+
+
+@dataclass
 class PendingIdentity:
     """Samples accumulated for a tracker ID before creating a permanent identity."""
 
     samples: list[PendingSample] = field(default_factory=list)
+    recognition_votes: list[PendingVote] = field(default_factory=list)
     last_sample_frame: int = -1
+    first_seen_time: float = field(default_factory=time.time)
 
 
 class PersonFaceIdData(app_callback_class):
@@ -130,6 +142,17 @@ class PersonFaceIdApp(GStreamerApp):
         self.samples_per_person = self.options_menu.samples_per_person
         self.unknown_sample_interval = self.options_menu.unknown_sample_interval
         self.min_enroll_confidence = self.options_menu.min_enroll_confidence
+        self.min_unknown_age_seconds = self.options_menu.min_unknown_age_seconds
+        self.recognition_vote_window = max(1, self.options_menu.recognition_vote_window)
+        self.recognition_vote_threshold = max(1, self.options_menu.recognition_vote_threshold)
+        self.recognition_vote_threshold = min(
+            self.recognition_vote_threshold,
+            self.recognition_vote_window,
+        )
+        self.min_enroll_face_width_ratio = self.options_menu.min_enroll_face_width_ratio
+        self.min_enroll_face_height_ratio = self.options_menu.min_enroll_face_height_ratio
+        self.max_enroll_edge_margin = self.options_menu.max_enroll_edge_margin
+        self.min_enroll_blur_score = self.options_menu.min_enroll_blur_score
         self.print_every_frame = self.options_menu.print_every_frame
         self.notify_url = self.options_menu.notify_url
         self.person_class_id = self.options_menu.person_class_id
@@ -291,6 +314,51 @@ class PersonFaceIdApp(GStreamerApp):
             type=float,
             default=0.55,
             help="Minimum face detection confidence for automatic enrollment samples.",
+        )
+        parser.add_argument(
+            "--min-unknown-age-seconds",
+            type=float,
+            default=2.0,
+            help="Minimum time to observe an unknown track before creating a new person.",
+        )
+        parser.add_argument(
+            "--recognition-vote-window",
+            type=int,
+            default=5,
+            help="Number of recent embeddings used for pending recognition voting.",
+        )
+        parser.add_argument(
+            "--recognition-vote-threshold",
+            type=int,
+            default=3,
+            help="Votes for one existing person required before binding an unknown track.",
+        )
+        parser.add_argument(
+            "--min-enroll-face-width-ratio",
+            type=float,
+            default=0.03,
+            help="Minimum face bbox width, as a fraction of frame width, for enrollment samples.",
+        )
+        parser.add_argument(
+            "--min-enroll-face-height-ratio",
+            type=float,
+            default=0.04,
+            help="Minimum face bbox height, as a fraction of frame height, for enrollment samples.",
+        )
+        parser.add_argument(
+            "--max-enroll-edge-margin",
+            type=float,
+            default=0.02,
+            help="Reject enrollment samples when the face bbox is this close to a frame edge.",
+        )
+        parser.add_argument(
+            "--min-enroll-blur-score",
+            type=float,
+            default=0.0,
+            help=(
+                "Minimum Laplacian variance for enrollment crops. "
+                "Default 0 disables blur filtering."
+            ),
         )
         parser.add_argument(
             "--print-every-frame",
@@ -655,9 +723,174 @@ class PersonFaceIdApp(GStreamerApp):
         return str(image_path)
 
     def _recognize_embedding(self, embedding_vector: np.ndarray) -> tuple[dict, float]:
-        person = self.db_handler.search_record(embedding=embedding_vector)
+        person = self.db_handler.search_record_deep(embedding=embedding_vector)
         confidence = 0.0 if person["label"] == "Unknown" else 1 - person["_distance"]
         return person, confidence
+
+    def _record_pending_vote(
+        self,
+        track_id: int,
+        person: dict,
+        confidence: float,
+    ) -> PendingVote | None:
+        pending = self.pending_unknowns.setdefault(track_id, PendingIdentity())
+        if person["label"] == "Unknown":
+            vote = PendingVote(
+                global_id=None,
+                label=None,
+                confidence=0.0,
+                timestamp=int(time.time()),
+            )
+        else:
+            vote = PendingVote(
+                global_id=person["global_id"],
+                label=person["label"],
+                confidence=confidence,
+                timestamp=int(time.time()),
+            )
+
+        pending.recognition_votes.append(vote)
+        if len(pending.recognition_votes) > self.recognition_vote_window:
+            pending.recognition_votes = pending.recognition_votes[-self.recognition_vote_window :]
+        return self._stable_pending_vote(pending)
+
+    def _stable_pending_vote(self, pending: PendingIdentity) -> PendingVote | None:
+        votes = pending.recognition_votes[-self.recognition_vote_window :]
+        if len(votes) < self.recognition_vote_threshold:
+            return None
+
+        counts: dict[str, int] = {}
+        best_vote_by_id: dict[str, PendingVote] = {}
+        for vote in votes:
+            if vote.global_id is None:
+                continue
+            counts[vote.global_id] = counts.get(vote.global_id, 0) + 1
+            current_best = best_vote_by_id.get(vote.global_id)
+            if current_best is None or vote.confidence > current_best.confidence:
+                best_vote_by_id[vote.global_id] = vote
+
+        if not counts:
+            return None
+
+        global_id, count = max(counts.items(), key=lambda item: item[1])
+        if count < self.recognition_vote_threshold:
+            return None
+        return best_vote_by_id[global_id]
+
+    def _bind_existing_person(
+        self,
+        track_id: int,
+        person: dict,
+        confidence: float,
+        state: str,
+        person_detection,
+    ) -> None:
+        pending = self.pending_unknowns.get(track_id)
+        if pending is not None:
+            self._consume_pending_samples_for_existing_person(pending, person)
+        self.track_to_global_id[track_id] = person["global_id"]
+        self.track_to_label[track_id] = person["label"]
+        updated_record = self._mark_person_seen(person["global_id"], track_id)
+        self.pending_unknowns.pop(track_id, None)
+        self._add_identity_classification(
+            person_detection,
+            person["label"],
+            confidence,
+            self.person_tracker_name,
+            track_id,
+        )
+        self._print_identity(
+            track_id,
+            person["global_id"],
+            person["label"],
+            confidence,
+            state,
+        )
+        if updated_record and updated_record.get("visit_incremented"):
+            self._notify_frontend(
+                "recognized",
+                person["global_id"],
+                person["label"],
+                track_id,
+                confidence,
+                visit_count=updated_record["visit_count"],
+            )
+
+    def _bind_existing_person_from_vote(
+        self,
+        track_id: int,
+        vote: PendingVote,
+        state: str,
+        person_detection,
+    ) -> bool:
+        if vote.global_id is None:
+            return False
+        person = self.db_handler.get_record_by_id(vote.global_id)
+        if person is None:
+            return False
+        self._bind_existing_person(
+            track_id,
+            person,
+            vote.confidence,
+            state,
+            person_detection,
+        )
+        return True
+
+    def _consume_pending_samples_for_existing_person(
+        self,
+        pending: PendingIdentity,
+        person: dict,
+    ) -> None:
+        for sample in pending.samples:
+            matched_person, _ = self._recognize_embedding(sample.embedding)
+            if matched_person["global_id"] == person["global_id"]:
+                current_record = self.db_handler.get_record_by_id(person["global_id"])
+                if current_record is not None:
+                    self.db_handler.insert_new_sample(
+                        record=current_record,
+                        embedding=sample.embedding,
+                        sample=sample.image_path,
+                        timestamp=sample.timestamp,
+                    )
+                continue
+
+            Path(sample.image_path).unlink(missing_ok=True)
+
+    def _is_good_enrollment_sample(
+        self,
+        frame: np.ndarray,
+        face_detection,
+        width: int,
+        height: int,
+    ) -> bool:
+        bbox = face_detection.get_bbox()
+        bbox_width = bbox.xmax() - bbox.xmin()
+        bbox_height = bbox.ymax() - bbox.ymin()
+        if bbox_width < self.min_enroll_face_width_ratio:
+            return False
+        if bbox_height < self.min_enroll_face_height_ratio:
+            return False
+
+        margin = self.max_enroll_edge_margin
+        if (
+            bbox.xmin() <= margin
+            or bbox.ymin() <= margin
+            or bbox.xmax() >= 1.0 - margin
+            or bbox.ymax() >= 1.0 - margin
+        ):
+            return False
+
+        if self.min_enroll_blur_score <= 0:
+            return True
+
+        x1, y1, x2, y2 = self._bbox_to_pixels(face_detection, width, height)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return False
+        gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
+        blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
+        return blur_score >= self.min_enroll_blur_score
 
     def _enroll_if_ready(
         self,
@@ -667,37 +900,39 @@ class PersonFaceIdApp(GStreamerApp):
         pending = self.pending_unknowns.get(track_id)
         if pending is None or len(pending.samples) < self.samples_per_person:
             return
+        if time.time() - pending.first_seen_time < self.min_unknown_age_seconds:
+            return
+
+        stable_vote = self._stable_pending_vote(pending)
+        if stable_vote is not None and self._bind_existing_person_from_vote(
+            track_id,
+            stable_vote,
+            "recognized-by-votes",
+            person_detection,
+        ):
+            return
+
+        for sample in pending.samples:
+            person, confidence = self._recognize_embedding(sample.embedding)
+            stable_vote = self._record_pending_vote(track_id, person, confidence)
+            if stable_vote is not None and self._bind_existing_person_from_vote(
+                track_id,
+                stable_vote,
+                "recognized-by-samples",
+                person_detection,
+            ):
+                return
 
         avg_embedding = np.mean([sample.embedding for sample in pending.samples], axis=0)
         person, confidence = self._recognize_embedding(avg_embedding)
         if person["label"] != "Unknown":
-            self.track_to_global_id[track_id] = person["global_id"]
-            self.track_to_label[track_id] = person["label"]
-            updated_record = self._mark_person_seen(person["global_id"], track_id)
-            self._add_identity_classification(
-                person_detection,
-                person["label"],
-                confidence,
-                self.person_tracker_name,
+            self._bind_existing_person(
                 track_id,
-            )
-            self._print_identity(
-                track_id,
-                person["global_id"],
-                person["label"],
+                person,
                 confidence,
                 "recognized-after-samples",
+                person_detection,
             )
-            if updated_record and updated_record.get("visit_incremented"):
-                self._notify_frontend(
-                    "recognized",
-                    person["global_id"],
-                    person["label"],
-                    track_id,
-                    confidence,
-                    visit_count=updated_record["visit_count"],
-                )
-            self.pending_unknowns.pop(track_id, None)
             return
 
         label = self._make_person_label()
@@ -753,6 +988,8 @@ class PersonFaceIdApp(GStreamerApp):
     ) -> None:
         detection_confidence = face_detection.get_confidence()
         if detection_confidence < self.min_enroll_confidence:
+            return
+        if not self._is_good_enrollment_sample(frame, face_detection, width, height):
             return
 
         pending = self.pending_unknowns.setdefault(track_id, PendingIdentity())
@@ -1009,42 +1246,39 @@ class PersonFaceIdApp(GStreamerApp):
             )
 
             person, confidence = self._recognize_embedding(embedding_vector)
-            if person["label"] != "Unknown":
-                self.track_to_global_id[matched_person_track_id] = person["global_id"]
-                self.track_to_label[matched_person_track_id] = person["label"]
-                updated_record = self._mark_person_seen(
-                    person["global_id"],
-                    matched_person_track_id,
-                )
-                self.pending_unknowns.pop(matched_person_track_id, None)
-                self._add_identity_classification(
-                    matched_person,
-                    person["label"],
-                    confidence,
-                    self.person_tracker_name,
-                    matched_person_track_id,
-                )
+            stable_vote = self._record_pending_vote(
+                matched_person_track_id,
+                person,
+                confidence,
+            )
+            if stable_vote is not None and self._bind_existing_person_from_vote(
+                matched_person_track_id,
+                stable_vote,
+                "recognized-by-votes",
+                matched_person,
+            ):
                 stats["known"] += 1
                 if frame is not None and self.debug_face_overlay:
                     self._draw_detection(frame, detection, width, height, "face")
-                    self._draw_detection(frame, matched_person, width, height, person["label"])
+                    self._draw_detection(
+                        frame,
+                        matched_person,
+                        width,
+                        height,
+                        stable_vote.label or "Unknown",
+                    )
                     user_data.set_frame(frame)
-                self._print_identity(
+                continue
+
+            if person["label"] != "Unknown":
+                logger.debug(
+                    "Pending recognition vote: track_id=%d global_id=%s label=%s "
+                    "confidence=%.2f",
                     matched_person_track_id,
                     person["global_id"],
                     person["label"],
                     confidence,
-                    "recognized",
                 )
-                if updated_record and updated_record.get("visit_incremented"):
-                    self._notify_frontend(
-                        "recognized",
-                        person["global_id"],
-                        person["label"],
-                        matched_person_track_id,
-                        confidence,
-                        visit_count=updated_record["visit_count"],
-                    )
                 continue
 
             stats["unknown"] += 1

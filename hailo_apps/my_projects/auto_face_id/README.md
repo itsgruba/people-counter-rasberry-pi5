@@ -133,8 +133,15 @@ It exposes:
 
 - `GET /api/people` - lightweight карточки людей with `label`, `visit_count`, `thumbnail_url`
 - `GET /api/people/{global_id}` - full record for one person
+- `DELETE /api/people/{global_id}` - delete one person and their saved sample files
 - `GET /samples/{filename}` - serves the saved JPEG sample images
 - `POST /api/events` - optional event sink for camera notifications
+
+Manual deletion example:
+
+```bash
+curl -X DELETE http://127.0.0.1:8000/api/people/<uuid>
+```
 
 The frontend can poll `GET /api/people` every few seconds, or you can use
 `--notify-url http://127.0.0.1:8000/api/events` in `person_face_id.py` to push events on

@@ -82,6 +82,13 @@ class PersonResponse(BaseModel):
     person: PersonDetails
 
 
+class DeletePersonResponse(BaseModel):
+    ok: bool = Field(..., examples=[True])
+    global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
+    label: str = Field(..., examples=["person_1"])
+    deleted_sample_count: int = Field(..., examples=[5])
+
+
 class EventPayload(BaseModel):
     event: str = Field(..., examples=["recognized"])
     global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
@@ -140,6 +147,12 @@ EVENT_EXAMPLE = {
     "confidence": 0.91,
     "visit_count": 4,
     "timestamp": 1717500000,
+}
+DELETE_PERSON_EXAMPLE = {
+    "ok": True,
+    "global_id": "3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1",
+    "label": "person_1",
+    "deleted_sample_count": 5,
 }
 
 WEBSOCKET_EVENT_EXAMPLE = {
@@ -298,6 +311,38 @@ def get_person(global_id: str, request: Request) -> PersonResponse:
             "samples": samples,
         }
     }
+
+
+@app.delete(
+    "/api/people/{global_id}",
+    response_model=DeletePersonResponse,
+    responses={
+        200: {"content": {"application/json": {"example": DELETE_PERSON_EXAMPLE}}},
+        404: {"description": "Person not found"},
+    },
+)
+async def delete_person(global_id: str, request: Request) -> DeletePersonResponse:
+    db = _db(request)
+    person = db.get_record_by_id(global_id)
+    if person is None:
+        raise HTTPException(status_code=404, detail="Person not found")
+
+    deleted_sample_count = len(person.get("samples_json") or [])
+    db.delete_record(global_id)
+
+    response = {
+        "ok": True,
+        "global_id": person["global_id"],
+        "label": person["label"],
+        "deleted_sample_count": deleted_sample_count,
+    }
+    await _ws_manager(request).broadcast(
+        {
+            "type": "person_deleted",
+            "data": response,
+        }
+    )
+    return response
 
 
 @app.get("/samples/{filename}")

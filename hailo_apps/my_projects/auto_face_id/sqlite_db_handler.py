@@ -42,6 +42,7 @@ class SQLiteDatabaseHandler:
         self._create_schema()
         self._ensure_person_columns()
         self._embedding_cache: dict[str, np.ndarray] = {}
+        self._sample_embedding_cache: list[tuple[str, np.ndarray]] = []
         self._reload_embedding_cache()
 
     def _create_schema(self) -> None:
@@ -131,6 +132,18 @@ class SQLiteDatabaseHandler:
             self._embedding_cache = {
                 row["global_id"]: self._blob_embedding(row["avg_embedding"]) for row in rows
             }
+            sample_rows = self._connection.execute(
+                """
+                SELECT persons.global_id, face_samples.embedding
+                FROM face_samples
+                JOIN persons ON persons.id = face_samples.person_id
+                ORDER BY face_samples.rowid
+                """
+            ).fetchall()
+            self._sample_embedding_cache = [
+                (row["global_id"], self._blob_embedding(row["embedding"]))
+                for row in sample_rows
+            ]
 
     def _sample_rows(self, person_id: int) -> list[sqlite3.Row]:
         return self._connection.execute(
@@ -242,6 +255,7 @@ class SQLiteDatabaseHandler:
                 (sample_id, cursor.lastrowid, vector.tobytes(), sample, timestamp),
             )
             self._embedding_cache[global_id] = vector.copy()
+            self._sample_embedding_cache.append((global_id, vector.copy()))
 
         return self.get_record_by_id(global_id)
 
@@ -337,6 +351,7 @@ class SQLiteDatabaseHandler:
                 (avg_embedding.tobytes(), timestamp, person["id"]),
             )
             self._embedding_cache[global_id] = avg_embedding
+            self._sample_embedding_cache.append((global_id, vector.copy()))
 
     def search_record(
         self,
@@ -361,6 +376,40 @@ class SQLiteDatabaseHandler:
                 ),
                 key=lambda item: item[1],
             )
+            row = self._connection.execute(
+                "SELECT * FROM persons WHERE global_id = ?", (global_id,)
+            ).fetchone()
+            if row is None:
+                return self._unknown_record()
+
+            confidence = 1.0 - distance
+            if confidence > row["classification_confidence_threshold"]:
+                return self._row_to_record(row, distance=distance)
+            return self._unknown_record()
+
+    def search_record_deep(
+        self,
+        embedding: np.ndarray,
+        metric_type: str = "cosine",
+    ) -> dict[str, Any]:
+        """Search average person embeddings plus each stored face sample."""
+        if metric_type != "cosine":
+            raise ValueError("SQLiteDatabaseHandler currently supports only cosine distance.")
+
+        query = self._embedding_array(embedding)
+        with self._lock:
+            candidates: list[tuple[str, float]] = [
+                (candidate_id, self._cosine_distance(query, candidate_embedding))
+                for candidate_id, candidate_embedding in self._embedding_cache.items()
+            ]
+            candidates.extend(
+                (candidate_id, self._cosine_distance(query, sample_embedding))
+                for candidate_id, sample_embedding in self._sample_embedding_cache
+            )
+            if not candidates:
+                return self._unknown_record()
+
+            global_id, distance = min(candidates, key=lambda item: item[1])
             row = self._connection.execute(
                 "SELECT * FROM persons WHERE global_id = ?", (global_id,)
             ).fetchone()
@@ -435,6 +484,11 @@ class SQLiteDatabaseHandler:
             ]
             self._connection.execute("DELETE FROM persons WHERE id = ?", (row["id"],))
             self._embedding_cache.pop(global_id, None)
+            self._sample_embedding_cache = [
+                (candidate_id, embedding)
+                for candidate_id, embedding in self._sample_embedding_cache
+                if candidate_id != global_id
+            ]
         for sample_path in sample_paths:
             self._delete_sample_file(sample_path)
 
@@ -443,6 +497,7 @@ class SQLiteDatabaseHandler:
             self._connection.execute("DELETE FROM persons")
             self._connection.execute("DELETE FROM sqlite_sequence WHERE name = 'persons'")
             self._embedding_cache.clear()
+            self._sample_embedding_cache.clear()
         for sample_path in self.samples_dir.iterdir():
             if sample_path.is_file():
                 os.remove(sample_path)
