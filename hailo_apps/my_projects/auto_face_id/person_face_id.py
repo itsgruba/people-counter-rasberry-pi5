@@ -855,7 +855,7 @@ class PersonFaceIdApp(GStreamerApp):
                 label = "person track_id=-"
             else:
                 person_id = self.track_to_label.get(track_id, "Unknown")
-                label = f"person_id={person_id} person track_id={track_id}"
+                label = f"person_id={person_id} track_id={track_id}"
             self._draw_detection(
                 frame,
                 person_detection,
