@@ -23,6 +23,7 @@ dependencies = [
     "python-dotenv",
     "pyyaml",
     "Pillow",
+    "flask",
     "lancedb",
     "tokenizers",
 

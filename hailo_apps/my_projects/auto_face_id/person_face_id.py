@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -124,6 +125,45 @@ class PersonFaceIdData(app_callback_class):
     def __init__(self) -> None:
         super().__init__()
         self.latest_track_id = -1
+        self.latest_debug_jpeg: bytes | None = None
+        self.latest_debug_frame_number = 0
+        self.latest_debug_frame_timestamp = 0.0
+        self._debug_frame_condition = threading.Condition()
+
+    def set_debug_frame(self, frame: np.ndarray, frame_number: int, jpeg_quality: int) -> None:
+        """Store the latest processed frame as JPEG for the MJPEG debug endpoint."""
+        jpeg_quality = max(1, min(jpeg_quality, 100))
+        encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_quality]
+        bgr_frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        success, encoded = cv2.imencode(".jpg", bgr_frame, encode_params)
+        if not success:
+            logger.warning("Failed to encode debug frame %d as JPEG", frame_number)
+            return
+
+        with self._debug_frame_condition:
+            self.latest_debug_jpeg = encoded.tobytes()
+            self.latest_debug_frame_number = frame_number
+            self.latest_debug_frame_timestamp = time.time()
+            self._debug_frame_condition.notify_all()
+
+    def wait_for_debug_frame(
+        self,
+        last_frame_number: int | None,
+        timeout: float = 1.0,
+    ) -> tuple[bytes | None, int]:
+        """Wait until a newer debug frame is available, then return its JPEG bytes."""
+        with self._debug_frame_condition:
+            self._debug_frame_condition.wait_for(
+                lambda: (
+                    not self.running
+                    or (
+                        self.latest_debug_jpeg is not None
+                        and self.latest_debug_frame_number != last_frame_number
+                    )
+                ),
+                timeout=timeout,
+            )
+            return self.latest_debug_jpeg, self.latest_debug_frame_number
 
 
 class PersonFaceIdApp(GStreamerApp):
@@ -158,10 +198,19 @@ class PersonFaceIdApp(GStreamerApp):
         self.notify_url = self.options_menu.notify_url
         self.person_class_id = self.options_menu.person_class_id
         self.debug_face_overlay = self.options_menu.use_frame
+        self.debug_stream_enabled = not self.options_menu.disable_debug_stream
+        self.debug_stream_host = self.options_menu.debug_stream_host
+        self.debug_stream_port = self.options_menu.debug_stream_port
+        self.debug_jpeg_quality = self.options_menu.debug_jpeg_quality
+        self.debug_show_stats = not self.options_menu.debug_stream_no_stats
         self.low_latency_enabled = not self.options_menu.disable_low_latency
         self.low_latency_queue_size = max(1, self.options_menu.low_latency_queue_size)
         self.pipeline_latency = max(0, self.options_menu.pipeline_latency_ms)
         self._shutdown_started = False
+        self._debug_fps = 0.0
+        self._debug_fps_frames = 0
+        self._debug_fps_updated_at = time.time()
+        self._debug_server_thread: threading.Thread | None = None
         self.face_tracker_name = "hailo_face_tracker"
         self.person_tracker_name = "person_tracker"
         self.tracker = HailoTracker.get_instance()
@@ -270,6 +319,12 @@ class PersonFaceIdApp(GStreamerApp):
         logger.info("Person-face database: %s", self.database_dir / DB_NAME)
         logger.info("Person-face samples: %s", self.samples_dir)
         logger.info("Person-face database records: %d", len(self.db_handler.get_all_records()))
+
+        if self.options_menu.disable_local_display:
+            self.video_sink = "fakesink"
+
+        if self.debug_stream_enabled:
+            self._start_debug_stream_server()
 
         self.create_pipeline()
         self._connect_face_embedding_callback()
@@ -384,6 +439,41 @@ class PersonFaceIdApp(GStreamerApp):
             ),
         )
         parser.add_argument(
+            "--disable-debug-stream",
+            action="store_true",
+            help="Disable the built-in Flask MJPEG debug stream.",
+        )
+        parser.add_argument(
+            "--debug-stream-host",
+            default="0.0.0.0",
+            help="Host/interface for the Flask MJPEG debug server. Default: 0.0.0.0.",
+        )
+        parser.add_argument(
+            "--debug-stream-port",
+            type=int,
+            default=8090,
+            help="Port for the Flask MJPEG debug server. Default: 8090.",
+        )
+        parser.add_argument(
+            "--debug-jpeg-quality",
+            type=int,
+            default=80,
+            help="JPEG quality for the MJPEG debug stream, from 1 to 100. Default: 80.",
+        )
+        parser.add_argument(
+            "--debug-stream-no-stats",
+            action="store_true",
+            help="Do not draw frame/FPS/statistics text on the MJPEG debug stream.",
+        )
+        parser.add_argument(
+            "--disable-local-display",
+            action="store_true",
+            help=(
+                "Use a fakesink for the GStreamer display branch. Useful when running "
+                "headless and watching the processed stream through /debug."
+            ),
+        )
+        parser.add_argument(
             "--disable-low-latency",
             action="store_true",
             help=(
@@ -410,6 +500,81 @@ class PersonFaceIdApp(GStreamerApp):
             ),
         )
         return parser
+
+    def _start_debug_stream_server(self) -> None:
+        try:
+            from flask import Flask, Response, jsonify, stream_with_context
+        except ImportError as exc:
+            raise RuntimeError(
+                "Flask is required for the MJPEG debug stream. Install it with `pip install flask` "
+                "or run with --disable-debug-stream."
+            ) from exc
+
+        flask_app = Flask(f"{__name__}.debug_stream")
+
+        @flask_app.get("/")
+        def index():
+            return (
+                "<!doctype html><html><head><title>Person Face ID Debug</title>"
+                "<style>html,body{margin:0;background:#111;height:100%;}"
+                "img{display:block;width:100%;height:100%;object-fit:contain;}</style>"
+                "</head><body><img src=\"/debug\" alt=\"debug stream\"></body></html>"
+            )
+
+        @flask_app.get("/debug")
+        def debug_stream():
+            return Response(
+                stream_with_context(self._mjpeg_debug_frames()),
+                mimetype="multipart/x-mixed-replace; boundary=frame",
+            )
+
+        @flask_app.get("/health")
+        def health():
+            return jsonify(
+                {
+                    "ok": True,
+                    "frame_number": self.user_data.latest_debug_frame_number,
+                    "last_frame_timestamp": self.user_data.latest_debug_frame_timestamp,
+                }
+            )
+
+        self._debug_server_thread = threading.Thread(
+            target=flask_app.run,
+            kwargs={
+                "host": self.debug_stream_host,
+                "port": self.debug_stream_port,
+                "threaded": True,
+                "use_reloader": False,
+            },
+            daemon=True,
+            name="person-face-id-debug-stream",
+        )
+        self._debug_server_thread.start()
+        logger.info(
+            "MJPEG debug stream listening on http://%s:%d/debug",
+            self.debug_stream_host,
+            self.debug_stream_port,
+        )
+
+    def _mjpeg_debug_frames(self):
+        last_frame_number = None
+        while self.user_data.running:
+            jpeg, frame_number = self.user_data.wait_for_debug_frame(
+                last_frame_number,
+                timeout=1.0,
+            )
+            if jpeg is None or frame_number == last_frame_number:
+                continue
+
+            last_frame_number = frame_number
+            yield (
+                b"--frame\r\n"
+                b"Content-Type: image/jpeg\r\n"
+                b"Cache-Control: no-cache\r\n"
+                b"Content-Length: " + str(len(jpeg)).encode("ascii") + b"\r\n\r\n"
+                + jpeg
+                + b"\r\n"
+            )
 
     def _load_next_person_index(self) -> int:
         max_index = 0
@@ -617,7 +782,14 @@ class PersonFaceIdApp(GStreamerApp):
         return Gst.PadProbeReturn.OK
 
     @staticmethod
-    def _draw_detection(frame: np.ndarray, detection, width: int, height: int, label: str) -> None:
+    def _draw_detection(
+        frame: np.ndarray,
+        detection,
+        width: int,
+        height: int,
+        label: str,
+        color: tuple[int, int, int] | None = None,
+    ) -> None:
         bbox = detection.get_bbox()
         x_min = max(0, min(bbox.xmin(), 1))
         y_min = max(0, min(bbox.ymin(), 1))
@@ -632,15 +804,98 @@ class PersonFaceIdApp(GStreamerApp):
         if x2 <= x1 or y2 <= y1:
             return
 
-        color = (0, 255, 0) if label == "face" else (255, 0, 0)
+        if color is None:
+            color = (0, 255, 0) if label.startswith("face") else (255, 0, 0)
+
         cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
+        text_size, baseline = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
+        text_width, text_height = text_size
+        text_x = x1
+        text_y = max(text_height + baseline + 4, y1 - 6)
+        cv2.rectangle(
+            frame,
+            (text_x, text_y - text_height - baseline - 4),
+            (min(width - 1, text_x + text_width + 6), text_y + baseline),
+            color,
+            -1,
+        )
         cv2.putText(
             frame,
             label,
-            (x1, max(15, y1 - 6)),
+            (text_x + 3, text_y - 3),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.5,
-            color,
+            (255, 255, 255),
+            1,
+            cv2.LINE_AA,
+        )
+
+    def _update_debug_fps(self) -> None:
+        self._debug_fps_frames += 1
+        now = time.time()
+        elapsed = now - self._debug_fps_updated_at
+        if elapsed < 1.0:
+            return
+        self._debug_fps = self._debug_fps_frames / elapsed
+        self._debug_fps_frames = 0
+        self._debug_fps_updated_at = now
+
+    def _draw_debug_overlay(
+        self,
+        frame: np.ndarray,
+        person_detections,
+        face_detections,
+        width: int,
+        height: int,
+        frame_number: int,
+    ) -> None:
+        for person_detection in person_detections:
+            track_id = self._get_track_id(person_detection)
+            if track_id is None:
+                label = "person track_id=-"
+            else:
+                person_id = self.track_to_label.get(track_id, "Unknown")
+                label = f"person_id={person_id} person track_id={track_id}"
+            self._draw_detection(
+                frame,
+                person_detection,
+                width,
+                height,
+                label,
+                color=(255, 70, 70),
+            )
+
+        for face_detection in face_detections:
+            track_id = self._get_track_id(face_detection)
+            if track_id is None:
+                label = "face track_id=-"
+            else:
+                label = f"face track_id={track_id}"
+            self._draw_detection(
+                frame,
+                face_detection,
+                width,
+                height,
+                label,
+                color=(40, 220, 90),
+            )
+
+        if not self.debug_show_stats:
+            return
+
+        self._update_debug_fps()
+        stats_text = (
+            f"frame={frame_number} fps={self._debug_fps:.1f} "
+            f"persons={len(person_detections)} faces={len(face_detections)}"
+        )
+        cv2.rectangle(frame, (8, 8), (min(width - 1, 520), 36), (0, 0, 0), -1)
+        cv2.putText(
+            frame,
+            stats_text,
+            (16, 29),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
             1,
             cv2.LINE_AA,
         )
@@ -1219,7 +1474,12 @@ class PersonFaceIdApp(GStreamerApp):
         pad = element.get_static_pad("src")
         fmt, width, height = get_caps_from_pad(pad)
         frame_number = user_data.get_count()
-        frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height) if self.debug_face_overlay else None
+        needs_debug_frame = self.debug_face_overlay or self.debug_stream_enabled
+        frame = (
+            get_numpy_from_buffer_efficient(buffer, fmt, width, height)
+            if needs_debug_frame
+            else None
+        )
 
         stats = self.recognition_stats
         stats["frames"] += 1
@@ -1270,10 +1530,6 @@ class PersonFaceIdApp(GStreamerApp):
                     matched_person_track_id,
                 )
                 stats["known"] += 1
-                if frame is not None and self.debug_face_overlay:
-                    self._draw_detection(frame, detection, width, height, "face")
-                    self._draw_detection(frame, matched_person, width, height, known_label)
-                    user_data.set_frame(frame)
                 self._print_identity(
                     matched_person_track_id,
                     known_global_id,
@@ -1308,16 +1564,6 @@ class PersonFaceIdApp(GStreamerApp):
                 matched_person,
             ):
                 stats["known"] += 1
-                if frame is not None and self.debug_face_overlay:
-                    self._draw_detection(frame, detection, width, height, "face")
-                    self._draw_detection(
-                        frame,
-                        matched_person,
-                        width,
-                        height,
-                        stable_vote.label or "Unknown",
-                    )
-                    user_data.set_frame(frame)
                 continue
 
             if person["label"] != "Unknown":
@@ -1335,11 +1581,6 @@ class PersonFaceIdApp(GStreamerApp):
             if frame is None:
                 frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height)
 
-            if self.debug_face_overlay:
-                self._draw_detection(frame, detection, width, height, "face")
-                self._draw_detection(frame, matched_person, width, height, "Unknown")
-                user_data.set_frame(frame)
-
             self._handle_unknown_person(
                 matched_person_track_id,
                 frame_number,
@@ -1350,6 +1591,21 @@ class PersonFaceIdApp(GStreamerApp):
                 width,
                 height,
             )
+
+        if frame is not None and needs_debug_frame:
+            debug_frame = frame.copy()
+            self._draw_debug_overlay(
+                debug_frame,
+                person_detections,
+                face_detections,
+                width,
+                height,
+                frame_number,
+            )
+            if self.debug_face_overlay:
+                user_data.set_frame(debug_frame)
+            if self.debug_stream_enabled:
+                user_data.set_debug_frame(debug_frame, frame_number, self.debug_jpeg_quality)
 
         self._log_recognition_stats(frame_number)
         return Gst.FlowReturn.OK
