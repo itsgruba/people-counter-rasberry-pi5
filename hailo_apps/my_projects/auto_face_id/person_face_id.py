@@ -143,6 +143,7 @@ class PersonFaceIdApp(GStreamerApp):
         self.unknown_sample_interval = self.options_menu.unknown_sample_interval
         self.min_enroll_confidence = self.options_menu.min_enroll_confidence
         self.min_unknown_age_seconds = self.options_menu.min_unknown_age_seconds
+        self.pending_identity_ttl_seconds = self.options_menu.pending_identity_ttl_seconds
         self.recognition_vote_window = max(1, self.options_menu.recognition_vote_window)
         self.recognition_vote_threshold = max(1, self.options_menu.recognition_vote_threshold)
         self.recognition_vote_threshold = min(
@@ -320,6 +321,15 @@ class PersonFaceIdApp(GStreamerApp):
             type=float,
             default=2.0,
             help="Minimum time to observe an unknown track before creating a new person.",
+        )
+        parser.add_argument(
+            "--pending-identity-ttl-seconds",
+            type=float,
+            default=15.0,
+            help=(
+                "Maximum age for unresolved pending unknown identities. "
+                "Expired pending samples are deleted. Use 0 to disable cleanup."
+            ),
         )
         parser.add_argument(
             "--recognition-vote-window",
@@ -777,6 +787,45 @@ class PersonFaceIdApp(GStreamerApp):
             return None
         return best_vote_by_id[global_id]
 
+    def _delete_pending_sample_files(self, pending: PendingIdentity) -> int:
+        deleted = 0
+        for sample in pending.samples:
+            try:
+                Path(sample.image_path).unlink(missing_ok=True)
+                deleted += 1
+            except OSError as exc:
+                logger.debug("Failed to delete pending sample %s: %s", sample.image_path, exc)
+        return deleted
+
+    def _discard_pending_identity(self, track_id: int, reason: str) -> None:
+        pending = self.pending_unknowns.pop(track_id, None)
+        if pending is None:
+            return
+
+        sample_count = len(pending.samples)
+        deleted_count = self._delete_pending_sample_files(pending)
+        logger.info(
+            "Removed pending identity track_id=%d reason=%s age=%.1fs samples=%d deleted=%d",
+            track_id,
+            reason,
+            time.time() - pending.first_seen_time,
+            sample_count,
+            deleted_count,
+        )
+
+    def _cleanup_expired_pending_unknowns(self) -> None:
+        if self.pending_identity_ttl_seconds <= 0:
+            return
+
+        now = time.time()
+        expired_track_ids = [
+            track_id
+            for track_id, pending in self.pending_unknowns.items()
+            if now - pending.first_seen_time >= self.pending_identity_ttl_seconds
+        ]
+        for track_id in expired_track_ids:
+            self._discard_pending_identity(track_id, "expired")
+
     def _bind_existing_person(
         self,
         track_id: int,
@@ -1178,6 +1227,7 @@ class PersonFaceIdApp(GStreamerApp):
         stats["faces"] += len(face_detections)
         if removed_detections:
             logger.debug("Removed %d non-person/non-face detections on frame %d", removed_detections, frame_number)
+        self._cleanup_expired_pending_unknowns()
 
         for detection in face_detections:
             matched_person = self._find_person_for_face(detection, person_detections, width, height)
