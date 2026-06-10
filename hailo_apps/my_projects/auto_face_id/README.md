@@ -51,18 +51,23 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --show-fps
 
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
-  --input http://192.168.8.10:81/stream \
-  --width 320 \
-  --height 240 \
+  --input http://192.168.8.14:8080/stream \
+  --width 640 \
+  --height 640 \
   --disable-sync \
   --show-fps
 
-python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
-  --input http://192.168.8.14:8080/stream \
-  --width 320 \
-  --height 240 \
-  --disable-sync \
-  --show-fps
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \  
+  --input http://192.168.8.14:8080/stream \  
+  --width 640 \  
+  --height 640 \  
+  --disable-sync \  
+  --show-fps \  
+  --disable-local-display \
+  --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt \
+  --samples-per-person 3 \  
+  --unknown-sample-interval 2 \  
+  --min-unknown-age-seconds 0.5
 ```
 
 ## Storage
@@ -207,4 +212,20 @@ Tune enrollment with:
 --samples-per-person 3
 --unknown-sample-interval 5
 --min-enroll-confidence 0.55
+--min-enroll-blur-score 150
+--min-enroll-face-width-ratio 0.05
+--min-enroll-face-height-ratio 0.06
+--enroll-zone 0.35,0.35,0.65,0.35,0.90,1.0,0.10,1.0
+--max-enroll-nose-offset 0.35
+--min-enroll-eye-balance 0.45
 ```
+
+Enrollment also filters out profile-like faces using SCRFD landmarks. This prevents
+side/back-of-head samples from accumulating enough unknown samples to create a new
+`person_N` identity.
+
+`--enroll-zone` limits new-person creation to a normalized polygon in the frame.
+The app still recognizes known people everywhere. By default the tested point is
+the bottom-center of the person box, so a hallway/corridor zone works well.
+Use `--enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt` to
+adjust the polygon while the app is running.

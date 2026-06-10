@@ -190,10 +190,22 @@ class PersonFaceIdApp(GStreamerApp):
             self.recognition_vote_threshold,
             self.recognition_vote_window,
         )
+        self.enroll_zone = self._parse_enroll_zone(self.options_menu.enroll_zone)
+        self.enroll_zone_file = (
+            Path(self.options_menu.enroll_zone_file).expanduser()
+            if self.options_menu.enroll_zone_file
+            else None
+        )
+        self._enroll_zone_file_mtime: float | None = None
+        self._reload_enroll_zone_file(force=True)
+        self.enroll_zone_anchor = self.options_menu.enroll_zone_anchor
         self.min_enroll_face_width_ratio = self.options_menu.min_enroll_face_width_ratio
         self.min_enroll_face_height_ratio = self.options_menu.min_enroll_face_height_ratio
         self.max_enroll_edge_margin = self.options_menu.max_enroll_edge_margin
         self.min_enroll_blur_score = self.options_menu.min_enroll_blur_score
+        self.max_enroll_nose_offset = self.options_menu.max_enroll_nose_offset
+        self.min_enroll_eye_balance = self.options_menu.min_enroll_eye_balance
+        self.require_enroll_landmarks = self.options_menu.require_enroll_landmarks
         self.print_every_frame = self.options_menu.print_every_frame
         self.notify_url = self.options_menu.notify_url
         self.person_class_id = self.options_menu.person_class_id
@@ -401,14 +413,37 @@ class PersonFaceIdApp(GStreamerApp):
         parser.add_argument(
             "--min-enroll-face-width-ratio",
             type=float,
-            default=0.03,
+            default=0.05,
             help="Minimum face bbox width, as a fraction of frame width, for enrollment samples.",
         )
         parser.add_argument(
             "--min-enroll-face-height-ratio",
             type=float,
-            default=0.04,
+            default=0.06,
             help="Minimum face bbox height, as a fraction of frame height, for enrollment samples.",
+        )
+        parser.add_argument(
+            "--enroll-zone",
+            default=None,
+            help=(
+                "Optional normalized enrollment polygon as x1,y1,x2,y2,... . "
+                "A four-number value is treated as rectangle xmin,ymin,xmax,ymax. "
+                "Recognition still runs everywhere; only new-person enrollment is limited."
+            ),
+        )
+        parser.add_argument(
+            "--enroll-zone-file",
+            default=None,
+            help=(
+                "Optional text file containing the same normalized polygon as --enroll-zone. "
+                "The file is reloaded while the app is running when it changes."
+            ),
+        )
+        parser.add_argument(
+            "--enroll-zone-anchor",
+            choices=("person-feet", "person-center", "face-center"),
+            default="person-feet",
+            help="Point tested against --enroll-zone. Default is bottom-center of the person box.",
         )
         parser.add_argument(
             "--max-enroll-edge-margin",
@@ -419,11 +454,34 @@ class PersonFaceIdApp(GStreamerApp):
         parser.add_argument(
             "--min-enroll-blur-score",
             type=float,
-            default=0.0,
+            default=150.0,
             help=(
                 "Minimum Laplacian variance for enrollment crops. "
-                "Default 0 disables blur filtering."
+                "Use 0 to disable blur filtering."
             ),
+        )
+        parser.add_argument(
+            "--max-enroll-nose-offset",
+            type=float,
+            default=0.35,
+            help=(
+                "Reject enrollment samples when the nose is too far from the midpoint "
+                "between the eyes, normalized by eye distance. Use 0 to disable."
+            ),
+        )
+        parser.add_argument(
+            "--min-enroll-eye-balance",
+            type=float,
+            default=0.45,
+            help=(
+                "Reject profile-like enrollment samples when nose-to-eye distances are "
+                "too uneven. Use 0 to disable."
+            ),
+        )
+        parser.add_argument(
+            "--require-enroll-landmarks",
+            action="store_true",
+            help="Reject enrollment samples that do not include face landmarks.",
         )
         parser.add_argument(
             "--print-every-frame",
@@ -500,6 +558,68 @@ class PersonFaceIdApp(GStreamerApp):
             ),
         )
         return parser
+
+    @staticmethod
+    def _parse_enroll_zone(value: str | None) -> list[tuple[float, float]] | None:
+        if value is None or not value.strip():
+            return None
+
+        try:
+            coordinates = [float(part.strip()) for part in value.split(",")]
+        except ValueError as exc:
+            raise ValueError(
+                "--enroll-zone must contain comma-separated numbers: x1,y1,x2,y2,..."
+            ) from exc
+
+        if len(coordinates) == 4:
+            x1, y1, x2, y2 = coordinates
+            coordinates = [x1, y1, x2, y1, x2, y2, x1, y2]
+
+        if len(coordinates) < 6 or len(coordinates) % 2 != 0:
+            raise ValueError("--enroll-zone must define at least three x,y points.")
+
+        points = [
+            (coordinates[index], coordinates[index + 1])
+            for index in range(0, len(coordinates), 2)
+        ]
+        for x, y in points:
+            if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
+                raise ValueError("--enroll-zone coordinates must be normalized from 0.0 to 1.0.")
+        return points
+
+    @staticmethod
+    def _read_enroll_zone_file(path: Path) -> str | None:
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                line = line.split("=", 1)[1].strip()
+            return line
+        return None
+
+    def _reload_enroll_zone_file(self, force: bool = False) -> None:
+        if self.enroll_zone_file is None:
+            return
+
+        try:
+            mtime = self.enroll_zone_file.stat().st_mtime
+        except OSError as exc:
+            if force:
+                logger.warning("Enrollment zone file is not readable: %s (%s)", self.enroll_zone_file, exc)
+            return
+
+        if not force and self._enroll_zone_file_mtime == mtime:
+            return
+
+        try:
+            zone_value = self._read_enroll_zone_file(self.enroll_zone_file)
+            self.enroll_zone = self._parse_enroll_zone(zone_value)
+            self._enroll_zone_file_mtime = mtime
+            logger.info("Reloaded enrollment zone from %s: %s", self.enroll_zone_file, zone_value)
+        except (OSError, ValueError) as exc:
+            self._enroll_zone_file_mtime = mtime
+            logger.warning("Keeping previous enrollment zone; failed to read %s: %s", self.enroll_zone_file, exc)
 
     def _start_debug_stream_server(self) -> None:
         try:
@@ -867,6 +987,67 @@ class PersonFaceIdApp(GStreamerApp):
             cv2.LINE_AA,
         )
 
+    def _draw_enroll_zone(self, frame: np.ndarray, width: int, height: int) -> None:
+        if not self.enroll_zone:
+            return
+
+        points = np.array(
+            [
+                (int(x * width), int(y * height))
+                for x, y in self.enroll_zone
+            ],
+            dtype=np.int32,
+        )
+        cv2.polylines(frame, [points], isClosed=True, color=(255, 190, 40), thickness=2)
+        for index, (x_norm, y_norm) in enumerate(self.enroll_zone, start=1):
+            x = int(x_norm * width)
+            y = int(y_norm * height)
+            label = f"{index}:{x_norm:.2f},{y_norm:.2f}"
+            cv2.circle(frame, (x, y), 5, (255, 190, 40), -1)
+            cv2.putText(
+                frame,
+                label,
+                (min(width - 120, max(8, x + 8)), min(height - 8, max(18, y - 8))),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.42,
+                (255, 190, 40),
+                1,
+                cv2.LINE_AA,
+            )
+        label_x = int(min(x for x, _ in self.enroll_zone) * width)
+        label_y = int(min(y for _, y in self.enroll_zone) * height)
+        cv2.putText(
+            frame,
+            "enroll zone",
+            (max(8, label_x), max(24, label_y - 6)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 190, 40),
+            2,
+            cv2.LINE_AA,
+        )
+
+    def _draw_enroll_anchor(
+        self,
+        frame: np.ndarray,
+        person_detection,
+        width: int,
+        height: int,
+    ) -> None:
+        if self.enroll_zone_anchor == "face-center":
+            return
+
+        point = self._enroll_zone_anchor_point(person_detection, None)
+        x = int(max(0.0, min(point[0], 1.0)) * width)
+        y = int(max(0.0, min(point[1], 1.0)) * height)
+        inside = self._point_in_polygon(point, self.enroll_zone) if self.enroll_zone else True
+        color = (40, 220, 90) if inside else (80, 80, 255)
+
+        cv2.circle(frame, (x, y), 6, color, -1)
+        cv2.circle(frame, (x, y), 10, color, 2)
+        cv2.line(frame, (x - 12, y), (x + 12, y), color, 1)
+        cv2.line(frame, (x, y - 12), (x, y + 12), color, 1)
+
     def _update_debug_fps(self) -> None:
         self._debug_fps_frames += 1
         now = time.time()
@@ -886,6 +1067,8 @@ class PersonFaceIdApp(GStreamerApp):
         height: int,
         frame_number: int,
     ) -> None:
+        self._draw_enroll_zone(frame, width, height)
+
         for person_detection in person_detections:
             track_id = self._get_track_id(person_detection)
             if track_id is None:
@@ -901,6 +1084,7 @@ class PersonFaceIdApp(GStreamerApp):
                 label,
                 color=(255, 70, 70),
             )
+            self._draw_enroll_anchor(frame, person_detection, width, height)
 
         for face_detection in face_detections:
             track_id = self._get_track_id(face_detection)
@@ -951,6 +1135,49 @@ class PersonFaceIdApp(GStreamerApp):
         x1, y1, x2, y2 = box
         px, py = point
         return x1 <= px <= x2 and y1 <= py <= y2
+
+    @staticmethod
+    def _point_in_polygon(
+        point: tuple[float, float],
+        polygon: list[tuple[float, float]],
+    ) -> bool:
+        x, y = point
+        inside = False
+        previous_x, previous_y = polygon[-1]
+        for current_x, current_y in polygon:
+            crosses_y = (current_y > y) != (previous_y > y)
+            if crosses_y:
+                denominator = previous_y - current_y
+                if abs(denominator) < 1e-12:
+                    previous_x, previous_y = current_x, current_y
+                    continue
+                slope_x = (
+                    (previous_x - current_x)
+                    * (y - current_y)
+                    / denominator
+                    + current_x
+                )
+                if x < slope_x:
+                    inside = not inside
+            previous_x, previous_y = current_x, current_y
+        return inside
+
+    def _enroll_zone_anchor_point(self, person_detection, face_detection) -> tuple[float, float]:
+        if self.enroll_zone_anchor == "face-center":
+            bbox = face_detection.get_bbox()
+        else:
+            bbox = person_detection.get_bbox()
+
+        x_center = (bbox.xmin() + bbox.xmax()) / 2.0
+        if self.enroll_zone_anchor == "person-feet":
+            return x_center, bbox.ymax()
+        return x_center, (bbox.ymin() + bbox.ymax()) / 2.0
+
+    def _is_inside_enroll_zone(self, person_detection, face_detection) -> bool:
+        if not self.enroll_zone:
+            return True
+        point = self._enroll_zone_anchor_point(person_detection, face_detection)
+        return self._point_in_polygon(point, self.enroll_zone)
 
     @staticmethod
     def _bbox_area(box: tuple[int, int, int, int]) -> int:
@@ -1318,6 +1545,9 @@ class PersonFaceIdApp(GStreamerApp):
         ):
             return False
 
+        if not self._is_front_facing_enrollment_sample(face_detection):
+            return False
+
         if self.min_enroll_blur_score <= 0:
             return True
 
@@ -1328,6 +1558,55 @@ class PersonFaceIdApp(GStreamerApp):
         gray = cv2.cvtColor(crop, cv2.COLOR_RGB2GRAY)
         blur_score = cv2.Laplacian(gray, cv2.CV_64F).var()
         return blur_score >= self.min_enroll_blur_score
+
+    @staticmethod
+    def _face_landmark_points(face_detection) -> list[tuple[float, float]] | None:
+        landmarks = face_detection.get_objects_typed(hailo.HAILO_LANDMARKS)
+        if not landmarks:
+            return None
+
+        points = landmarks[0].get_points()
+        if len(points) < 5:
+            return None
+
+        return [(float(point.x()), float(point.y())) for point in points[:5]]
+
+    def _is_front_facing_enrollment_sample(self, face_detection) -> bool:
+        points = self._face_landmark_points(face_detection)
+        if points is None:
+            return not self.require_enroll_landmarks
+
+        left_eye, right_eye, nose, left_mouth, right_mouth = points
+        eye_distance = abs(right_eye[0] - left_eye[0])
+        if eye_distance <= 1e-6:
+            return False
+
+        if self.max_enroll_nose_offset > 0:
+            eye_mid_x = (left_eye[0] + right_eye[0]) / 2.0
+            nose_offset = abs(nose[0] - eye_mid_x) / eye_distance
+            if nose_offset > self.max_enroll_nose_offset:
+                return False
+
+            mouth_mid_x = (left_mouth[0] + right_mouth[0]) / 2.0
+            mouth_offset = abs(mouth_mid_x - nose[0]) / eye_distance
+            if mouth_offset > self.max_enroll_nose_offset * 1.25:
+                return False
+
+        if self.min_enroll_eye_balance > 0:
+            left_nose_distance = abs(nose[0] - left_eye[0])
+            right_nose_distance = abs(right_eye[0] - nose[0])
+            larger_distance = max(left_nose_distance, right_nose_distance)
+            if larger_distance <= 1e-6:
+                return False
+            eye_balance = min(left_nose_distance, right_nose_distance) / larger_distance
+            if eye_balance < self.min_enroll_eye_balance:
+                return False
+
+        eye_tilt = abs(left_eye[1] - right_eye[1]) / eye_distance
+        if eye_tilt > 0.35:
+            return False
+
+        return True
 
     def _enroll_if_ready(
         self,
@@ -1446,6 +1725,13 @@ class PersonFaceIdApp(GStreamerApp):
         width: int,
         height: int,
     ) -> None:
+        self._enroll_if_ready(track_id, person_detection, frame, width, height)
+        if track_id not in self.pending_unknowns:
+            return
+
+        if not self._is_inside_enroll_zone(person_detection, face_detection):
+            return
+
         detection_confidence = face_detection.get_confidence()
         if detection_confidence < self.min_enroll_confidence:
             return
@@ -1607,6 +1893,8 @@ class PersonFaceIdApp(GStreamerApp):
         if buffer is None:
             logger.warning("Received None buffer.")
             return
+
+        self._reload_enroll_zone_file()
 
         roi = hailo.get_roi_from_buffer(buffer)
         removed_detections = self._prune_non_person_detections(roi)

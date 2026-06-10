@@ -40,6 +40,20 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
 - The main Hailo display should now show both `person` and `face` boxes.
 - The face box should not show a person ID. Only the person box shows `Unknown` or `person_N`.
 - `--use-frame` is optional and only opens an extra debug window from Python.
+- New unknown identities are enrolled only from reasonably sharp, front-facing
+  face samples. Tune this with `--min-enroll-blur-score`,
+  `--max-enroll-nose-offset`, and `--min-enroll-eye-balance`.
+- To create new people only inside a marked corridor, pass a normalized polygon
+  with `--enroll-zone`, for example
+  `--enroll-zone 0.35,0.35,0.65,0.35,0.90,1.0,0.10,1.0`. The debug stream draws
+  the zone so you can adjust the points. Green foot markers are inside the zone;
+  red foot markers are outside it.
+- For manual tuning without restarting the app, pass
+  `--enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt`.
+  Edit and save that file; the debug stream will show the updated polygon and
+  vertex numbers.
+- If people walk through the zone at normal speed, use faster enrollment:
+  `--samples-per-person 3 --unknown-sample-interval 2 --min-unknown-age-seconds 0.5`.
 - The app stores its database and samples in:
 
 ```text
