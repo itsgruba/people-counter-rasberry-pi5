@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
 import threading
 import time
@@ -439,7 +440,7 @@ class SQLiteDatabaseHandler:
             if record["samples_json"]:
                 sample_path = record["samples_json"][0]["sample_path"]
                 if sample_path:
-                    thumbnail_path = Path(sample_path).name
+                    thumbnail_path = self._sample_relative_path(sample_path)
             cards.append(
                 {
                     "global_id": record["global_id"],
@@ -499,9 +500,20 @@ class SQLiteDatabaseHandler:
             self._embedding_cache.clear()
             self._sample_embedding_cache.clear()
         for sample_path in self.samples_dir.iterdir():
-            if sample_path.is_file():
+            if sample_path.is_dir():
+                shutil.rmtree(sample_path)
+            elif sample_path.is_file():
                 os.remove(sample_path)
         print("All records deleted from the SQLite database")
+
+    def _sample_relative_path(self, sample_path: str | None) -> str | None:
+        if not sample_path:
+            return None
+        path = Path(sample_path)
+        try:
+            return path.resolve().relative_to(self.samples_dir.resolve()).as_posix()
+        except (OSError, ValueError):
+            return path.name
 
     def _delete_sample_file(self, sample_path: str | None) -> None:
         if not sample_path:
@@ -513,6 +525,22 @@ class SQLiteDatabaseHandler:
             return
         if path.exists() and path.is_file():
             os.remove(path)
+            self._delete_empty_sample_dirs(path.parent)
+
+    def _delete_empty_sample_dirs(self, start_dir: Path) -> None:
+        try:
+            current = start_dir.resolve()
+            samples_root = self.samples_dir.resolve()
+            current.relative_to(samples_root)
+        except (OSError, ValueError):
+            return
+
+        while current != samples_root:
+            try:
+                current.rmdir()
+            except OSError:
+                return
+            current = current.parent
 
     def close(self) -> None:
         with self._lock:

@@ -73,7 +73,7 @@ def _delete_orphan_samples(db: SQLiteDatabaseHandler) -> int:
     if not db.samples_dir.exists():
         return deleted
 
-    for path in db.samples_dir.iterdir():
+    for path in db.samples_dir.rglob("*"):
         if not path.is_file():
             continue
         try:
@@ -83,6 +83,16 @@ def _delete_orphan_samples(db: SQLiteDatabaseHandler) -> int:
         if resolved not in referenced:
             path.unlink()
             deleted += 1
+    for path in sorted(
+        db.samples_dir.rglob("*"),
+        key=lambda item: len(item.parts),
+        reverse=True,
+    ):
+        if path.is_dir():
+            try:
+                path.rmdir()
+            except OSError:
+                pass
     return deleted
 
 

@@ -9,6 +9,7 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
@@ -185,7 +186,23 @@ def _create_db() -> SQLiteDatabaseHandler:
 def _sample_url(sample_path: str | None) -> str | None:
     if not sample_path:
         return None
-    return f"/samples/{Path(sample_path).name}"
+    path = Path(sample_path)
+    if path.is_absolute():
+        try:
+            relative_path = path.resolve().relative_to(SAMPLES_DIR.resolve())
+        except (OSError, ValueError):
+            relative_path = Path(path.name)
+    else:
+        relative_path = path
+
+    safe_parts = [
+        part
+        for part in relative_path.parts
+        if part not in {"", ".", ".."} and part != relative_path.anchor
+    ]
+    if not safe_parts:
+        return None
+    return "/samples/" + "/".join(quote(part) for part in safe_parts)
 
 
 def _absolute_url(request: Request, path: str | None) -> str | None:
@@ -345,10 +362,13 @@ async def delete_person(global_id: str, request: Request) -> DeletePersonRespons
     return response
 
 
-@app.get("/samples/{filename}")
-def get_sample(filename: str) -> FileResponse:
-    safe_name = Path(filename).name
-    file_path = (SAMPLES_DIR / safe_name).resolve()
+@app.get("/samples/{sample_path:path}")
+def get_sample(sample_path: str) -> FileResponse:
+    relative_path = Path(sample_path)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    file_path = (SAMPLES_DIR / relative_path).resolve()
     try:
         file_path.relative_to(SAMPLES_DIR.resolve())
     except ValueError as exc:

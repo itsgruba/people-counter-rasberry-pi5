@@ -981,8 +981,59 @@ class PersonFaceIdApp(GStreamerApp):
 
         return frame[y_min:y_max, x_min:x_max]
 
-    def _save_face_sample(self, frame: np.ndarray, detection, width: int, height: int) -> str:
-        image_path = self.samples_dir / f"{uuid.uuid4()}.jpeg"
+    def _pending_sample_dir(self, track_id: int) -> Path:
+        return self.samples_dir / "_pending" / f"track_{track_id}"
+
+    def _person_sample_dir(self, label: str) -> Path:
+        return self.samples_dir / label
+
+    def _cleanup_empty_sample_dirs(self, start_dir: Path) -> None:
+        try:
+            current = start_dir.resolve()
+            samples_root = self.samples_dir.resolve()
+            current.relative_to(samples_root)
+        except (OSError, ValueError):
+            return
+
+        while current != samples_root:
+            try:
+                current.rmdir()
+            except OSError:
+                return
+            current = current.parent
+
+    def _move_sample_to_person_dir(self, sample: PendingSample, label: str) -> None:
+        source = Path(sample.image_path)
+        target_dir = self._person_sample_dir(label)
+        target_dir.mkdir(parents=True, exist_ok=True)
+
+        if source.parent == target_dir:
+            return
+
+        target = target_dir / source.name
+        if target.exists():
+            target = target_dir / f"{source.stem}_{uuid.uuid4().hex}{source.suffix}"
+
+        try:
+            source.replace(target)
+        except OSError as exc:
+            logger.warning("Failed to move sample %s to %s: %s", source, target_dir, exc)
+            return
+
+        sample.image_path = str(target)
+        self._cleanup_empty_sample_dirs(source.parent)
+
+    def _save_face_sample(
+        self,
+        track_id: int,
+        frame: np.ndarray,
+        detection,
+        width: int,
+        height: int,
+    ) -> str:
+        sample_dir = self._pending_sample_dir(track_id)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        image_path = sample_dir / f"{uuid.uuid4()}.jpeg"
         cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
         self.save_image_file(cropped, str(image_path))
         return str(image_path)
@@ -1045,8 +1096,10 @@ class PersonFaceIdApp(GStreamerApp):
     def _delete_pending_sample_files(self, pending: PendingIdentity) -> int:
         deleted = 0
         for sample in pending.samples:
+            sample_path = Path(sample.image_path)
             try:
-                Path(sample.image_path).unlink(missing_ok=True)
+                sample_path.unlink(missing_ok=True)
+                self._cleanup_empty_sample_dirs(sample_path.parent)
                 deleted += 1
             except OSError as exc:
                 logger.debug("Failed to delete pending sample %s: %s", sample.image_path, exc)
@@ -1149,6 +1202,7 @@ class PersonFaceIdApp(GStreamerApp):
         for sample in pending.samples:
             matched_person, _ = self._recognize_embedding(sample.embedding)
             if matched_person["global_id"] == person["global_id"]:
+                self._move_sample_to_person_dir(sample, person["label"])
                 current_record = self.db_handler.get_record_by_id(person["global_id"])
                 if current_record is not None:
                     self.db_handler.insert_new_sample(
@@ -1159,7 +1213,9 @@ class PersonFaceIdApp(GStreamerApp):
                     )
                 continue
 
-            Path(sample.image_path).unlink(missing_ok=True)
+            sample_path = Path(sample.image_path)
+            sample_path.unlink(missing_ok=True)
+            self._cleanup_empty_sample_dirs(sample_path.parent)
 
     def _is_good_enrollment_sample(
         self,
@@ -1240,6 +1296,9 @@ class PersonFaceIdApp(GStreamerApp):
             return
 
         label = self._make_person_label()
+        for sample in pending.samples:
+            self._move_sample_to_person_dir(sample, label)
+
         best_sample = max(pending.samples, key=lambda sample: sample.confidence)
         new_person = self.db_handler.create_record(
             embedding=avg_embedding,
@@ -1303,7 +1362,7 @@ class PersonFaceIdApp(GStreamerApp):
         ):
             return
 
-        image_path = self._save_face_sample(frame, face_detection, width, height)
+        image_path = self._save_face_sample(track_id, frame, face_detection, width, height)
         pending.samples.append(
             PendingSample(
                 embedding=embedding_vector,
