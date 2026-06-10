@@ -75,6 +75,21 @@ class SQLiteDatabaseHandler:
 
                 CREATE INDEX IF NOT EXISTS idx_face_samples_person_id
                 ON face_samples(person_id);
+
+                CREATE TABLE IF NOT EXISTS visits (
+                    id TEXT PRIMARY KEY,
+                    person_id INTEGER NOT NULL,
+                    visit_number INTEGER NOT NULL,
+                    visited_at INTEGER NOT NULL,
+                    photo_path TEXT NOT NULL,
+                    track_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    UNIQUE(person_id, visit_number),
+                    FOREIGN KEY (person_id) REFERENCES persons(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_visits_person_id
+                ON visits(person_id);
                 """
             )
 
@@ -157,6 +172,17 @@ class SQLiteDatabaseHandler:
             (person_id,),
         ).fetchall()
 
+    def _visit_rows(self, person_id: int) -> list[sqlite3.Row]:
+        return self._connection.execute(
+            """
+            SELECT id, visit_number, visited_at, photo_path, track_id
+            FROM visits
+            WHERE person_id = ?
+            ORDER BY visit_number
+            """,
+            (person_id,),
+        ).fetchall()
+
     def _row_to_record(self, row: sqlite3.Row, distance: float | None = None) -> dict[str, Any]:
         samples = [
             {
@@ -173,6 +199,16 @@ class SQLiteDatabaseHandler:
             "avg_embedding": self._blob_embedding(row["avg_embedding"]).tolist(),
             "last_sample_recieved_time": row["last_sample_received_time"],
             "samples_json": samples,
+            "visits_json": [
+                {
+                    "id": visit["id"],
+                    "visit_number": visit["visit_number"],
+                    "timestamp": visit["visited_at"],
+                    "photo_path": visit["photo_path"],
+                    "track_id": visit["track_id"],
+                }
+                for visit in self._visit_rows(row["id"])
+            ],
             "classificaiton_confidence_threshold": row[
                 "classification_confidence_threshold"
             ],
@@ -312,6 +348,70 @@ class SQLiteDatabaseHandler:
             record = self._row_to_record(updated_row)
             record["visit_incremented"] = should_increment
             return record
+
+    def add_visit_record(
+        self,
+        global_id: str,
+        visit_number: int,
+        timestamp: int,
+        photo_path: str,
+        track_id: int | None = None,
+        visit_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Store the visual evidence for one visit_count increment."""
+        visit_id = visit_id or str(uuid.uuid4())
+        with self._lock, self._connection:
+            person = self._connection.execute(
+                "SELECT id FROM persons WHERE global_id = ?",
+                (global_id,),
+            ).fetchone()
+            if person is None:
+                raise KeyError(f"Person not found: {global_id}")
+
+            self._connection.execute(
+                """
+                INSERT INTO visits (
+                    id,
+                    person_id,
+                    visit_number,
+                    visited_at,
+                    photo_path,
+                    track_id,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(person_id, visit_number) DO UPDATE SET
+                    visited_at = excluded.visited_at,
+                    photo_path = excluded.photo_path,
+                    track_id = excluded.track_id
+                """,
+                (
+                    visit_id,
+                    person["id"],
+                    visit_number,
+                    timestamp,
+                    photo_path,
+                    track_id,
+                    int(time.time()),
+                ),
+            )
+            row = self._connection.execute(
+                """
+                SELECT id, visit_number, visited_at, photo_path, track_id
+                FROM visits
+                WHERE person_id = ? AND visit_number = ?
+                """,
+                (person["id"], visit_number),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Failed to store visit record.")
+            return {
+                "id": row["id"],
+                "visit_number": row["visit_number"],
+                "timestamp": row["visited_at"],
+                "photo_path": row["photo_path"],
+                "track_id": row["track_id"],
+            }
 
     def insert_new_sample(
         self,
@@ -483,6 +583,9 @@ class SQLiteDatabaseHandler:
             sample_paths = [
                 sample["sample_path"] for sample in self._sample_rows(row["id"])
             ]
+            visit_paths = [
+                visit["photo_path"] for visit in self._visit_rows(row["id"])
+            ]
             self._connection.execute("DELETE FROM persons WHERE id = ?", (row["id"],))
             self._embedding_cache.pop(global_id, None)
             self._sample_embedding_cache = [
@@ -490,7 +593,7 @@ class SQLiteDatabaseHandler:
                 for candidate_id, embedding in self._sample_embedding_cache
                 if candidate_id != global_id
             ]
-        for sample_path in sample_paths:
+        for sample_path in [*sample_paths, *visit_paths]:
             self._delete_sample_file(sample_path)
 
     def clear_table(self) -> None:

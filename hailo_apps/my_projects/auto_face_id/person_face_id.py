@@ -700,6 +700,43 @@ class PersonFaceIdApp(GStreamerApp):
             track_id=track_id,
         )
 
+    def _record_visit_snapshot(
+        self,
+        person: dict,
+        track_id: int,
+        frame: np.ndarray | None,
+        person_detection,
+        width: int,
+        height: int,
+    ) -> None:
+        """Save visual evidence for a visit_count increment."""
+        if frame is None:
+            logger.warning(
+                "Visit count changed for %s but no frame was available for a snapshot.",
+                person.get("label", person.get("global_id")),
+            )
+            return
+
+        visit_number = int(person["visit_count"])
+        timestamp = int(person.get("last_seen_at") or time.time())
+        image_path = self._save_visit_snapshot(
+            label=person["label"],
+            visit_number=visit_number,
+            timestamp=timestamp,
+            track_id=track_id,
+            frame=frame,
+            detection=person_detection,
+            width=width,
+            height=height,
+        )
+        self.db_handler.add_visit_record(
+            global_id=person["global_id"],
+            visit_number=visit_number,
+            timestamp=timestamp,
+            photo_path=image_path,
+            track_id=track_id,
+        )
+
     def _notify_frontend(
         self,
         event: str,
@@ -987,6 +1024,9 @@ class PersonFaceIdApp(GStreamerApp):
     def _person_sample_dir(self, label: str) -> Path:
         return self.samples_dir / label
 
+    def _visit_sample_dir(self, label: str, visit_number: int) -> Path:
+        return self._person_sample_dir(label) / "visit_count" / f"visit_{visit_number}"
+
     def _cleanup_empty_sample_dirs(self, start_dir: Path) -> None:
         try:
             current = start_dir.resolve()
@@ -1035,6 +1075,26 @@ class PersonFaceIdApp(GStreamerApp):
         sample_dir.mkdir(parents=True, exist_ok=True)
         image_path = sample_dir / f"{uuid.uuid4()}.jpeg"
         cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
+        self.save_image_file(cropped, str(image_path))
+        return str(image_path)
+
+    def _save_visit_snapshot(
+        self,
+        label: str,
+        visit_number: int,
+        timestamp: int,
+        track_id: int,
+        frame: np.ndarray,
+        detection,
+        width: int,
+        height: int,
+    ) -> str:
+        visit_dir = self._visit_sample_dir(label, visit_number)
+        visit_dir.mkdir(parents=True, exist_ok=True)
+        image_path = visit_dir / f"snapshot_{timestamp}_track_{track_id}.jpeg"
+        cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
+        if cropped.size == 0:
+            cropped = frame
         self.save_image_file(cropped, str(image_path))
         return str(image_path)
 
@@ -1141,6 +1201,9 @@ class PersonFaceIdApp(GStreamerApp):
         confidence: float,
         state: str,
         person_detection,
+        frame: np.ndarray | None,
+        width: int,
+        height: int,
     ) -> None:
         pending = self.pending_unknowns.get(track_id)
         if pending is not None:
@@ -1164,6 +1227,14 @@ class PersonFaceIdApp(GStreamerApp):
             state,
         )
         if updated_record and updated_record.get("visit_incremented"):
+            self._record_visit_snapshot(
+                updated_record,
+                track_id,
+                frame,
+                person_detection,
+                width,
+                height,
+            )
             self._notify_frontend(
                 "recognized",
                 person["global_id"],
@@ -1179,6 +1250,9 @@ class PersonFaceIdApp(GStreamerApp):
         vote: PendingVote,
         state: str,
         person_detection,
+        frame: np.ndarray | None,
+        width: int,
+        height: int,
     ) -> bool:
         if vote.global_id is None:
             return False
@@ -1191,6 +1265,9 @@ class PersonFaceIdApp(GStreamerApp):
             vote.confidence,
             state,
             person_detection,
+            frame,
+            width,
+            height,
         )
         return True
 
@@ -1256,6 +1333,9 @@ class PersonFaceIdApp(GStreamerApp):
         self,
         track_id: int,
         person_detection,
+        frame: np.ndarray,
+        width: int,
+        height: int,
     ) -> None:
         pending = self.pending_unknowns.get(track_id)
         if pending is None or len(pending.samples) < self.samples_per_person:
@@ -1269,6 +1349,9 @@ class PersonFaceIdApp(GStreamerApp):
             stable_vote,
             "recognized-by-votes",
             person_detection,
+            frame,
+            width,
+            height,
         ):
             return
 
@@ -1280,6 +1363,9 @@ class PersonFaceIdApp(GStreamerApp):
                 stable_vote,
                 "recognized-by-samples",
                 person_detection,
+                frame,
+                width,
+                height,
             ):
                 return
 
@@ -1292,6 +1378,9 @@ class PersonFaceIdApp(GStreamerApp):
                 confidence,
                 "recognized-after-samples",
                 person_detection,
+                frame,
+                width,
+                height,
             )
             return
 
@@ -1328,6 +1417,14 @@ class PersonFaceIdApp(GStreamerApp):
             track_id,
         )
         self._print_identity(track_id, new_person["global_id"], label, 1.0, "enrolled")
+        self._record_visit_snapshot(
+            new_person,
+            track_id,
+            frame,
+            person_detection,
+            width,
+            height,
+        )
         self._notify_frontend(
             "enrolled",
             new_person["global_id"],
@@ -1376,7 +1473,7 @@ class PersonFaceIdApp(GStreamerApp):
             f"collecting: track_id={track_id} samples="
             f"{len(pending.samples)}/{self.samples_per_person}"
         )
-        self._enroll_if_ready(track_id, person_detection)
+        self._enroll_if_ready(track_id, person_detection, frame, width, height)
 
     @staticmethod
     def _is_pairing_sensitive_queue(queue_name: str) -> bool:
@@ -1616,11 +1713,16 @@ class PersonFaceIdApp(GStreamerApp):
                 person,
                 confidence,
             )
+            if stable_vote is not None and frame is None:
+                frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height)
             if stable_vote is not None and self._bind_existing_person_from_vote(
                 matched_person_track_id,
                 stable_vote,
                 "recognized-by-votes",
                 matched_person,
+                frame,
+                width,
+                height,
             ):
                 stats["known"] += 1
                 continue

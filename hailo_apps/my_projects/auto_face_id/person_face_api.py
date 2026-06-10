@@ -70,6 +70,19 @@ class SampleRef(BaseModel):
     )
 
 
+class VisitRef(BaseModel):
+    id: str | None = Field(default=None, examples=["visit-1"])
+    visit_number: int = Field(..., examples=[1])
+    timestamp: int | None = Field(default=None, examples=[1717500000])
+    track_id: int | None = Field(default=None, examples=[12])
+    photo_url: str | None = Field(
+        default=None,
+        examples=[
+            "http://127.0.0.1:8000/samples/person_1/visit_count/visit_1/snapshot.jpeg"
+        ],
+    )
+
+
 class PersonDetails(BaseModel):
     global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
     label: str = Field(..., examples=["person_1"])
@@ -77,6 +90,7 @@ class PersonDetails(BaseModel):
     last_seen_at: int | None = Field(default=None, examples=[1717500000])
     last_seen_track_id: int | None = Field(default=None, examples=[12])
     samples: list[SampleRef]
+    visits: list[VisitRef]
 
 
 class PersonResponse(BaseModel):
@@ -136,6 +150,18 @@ PERSON_EXAMPLE = {
                 "id": "sample-1",
                 "timestamp": 1717500000,
                 "sample_url": "http://127.0.0.1:8000/samples/abc123.jpeg",
+            }
+        ],
+        "visits": [
+            {
+                "id": "visit-1",
+                "visit_number": 1,
+                "timestamp": 1717500000,
+                "track_id": 12,
+                "photo_url": (
+                    "http://127.0.0.1:8000/samples/person_1/visit_count/visit_1/"
+                    "snapshot.jpeg"
+                ),
             }
         ],
     }
@@ -318,6 +344,18 @@ def get_person(global_id: str, request: Request) -> PersonResponse:
             }
         )
 
+    visits = []
+    for visit in person.get("visits_json") or []:
+        visits.append(
+            {
+                "id": visit.get("id"),
+                "visit_number": visit["visit_number"],
+                "timestamp": visit.get("timestamp"),
+                "track_id": visit.get("track_id"),
+                "photo_url": _absolute_url(request, _sample_url(visit.get("photo_path"))),
+            }
+        )
+
     return {
         "person": {
             "global_id": person["global_id"],
@@ -326,6 +364,7 @@ def get_person(global_id: str, request: Request) -> PersonResponse:
             "last_seen_at": person.get("last_seen_at"),
             "last_seen_track_id": person.get("last_seen_track_id"),
             "samples": samples,
+            "visits": visits,
         }
     }
 

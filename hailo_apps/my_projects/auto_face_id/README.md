@@ -96,6 +96,7 @@ The database contains:
 
 - `persons`: one row per known person
 - `face_samples`: one row per face embedding and JPEG sample
+- `visits`: one row per `visit_count` increment, with timestamp, `track_id`, and photo path
 
 ## Maintenance CLI
 
@@ -132,7 +133,7 @@ uvicorn hailo_apps.my_projects.auto_face_id.person_face_api:app \
 It exposes:
 
 - `GET /api/people` - lightweight карточки людей with `label`, `visit_count`, `thumbnail_url`
-- `GET /api/people/{global_id}` - full record for one person
+- `GET /api/people/{global_id}` - full record for one person, including `samples` and `visits`
 - `DELETE /api/people/{global_id}` - delete one person and their saved sample files
 - `GET /samples/{filename}` - serves the saved JPEG sample images
 - `POST /api/events` - optional event sink for camera notifications
@@ -152,6 +153,7 @@ The visit counter follows the `track_id` session rule:
 - if the same person stays on the same `track_id`, `visit_count` does not change
 - if the person leaves and comes back with a new `track_id`, `visit_count` increases
 - the current `last_seen_track_id` is stored in SQLite so the backend and frontend can stay in sync
+- every increment saves a JPEG under `samples/<person>/visit_count/visit_<N>/`
 
 Useful SQL queries:
 
@@ -169,6 +171,11 @@ ORDER BY persons.id;
 SELECT label, visits_count AS visit_count, last_seen_at, last_seen_track_id
 FROM persons
 ORDER BY id;
+
+SELECT persons.label, visits.visit_number, visits.visited_at, visits.photo_path
+FROM visits
+JOIN persons ON persons.id = visits.person_id
+ORDER BY persons.id, visits.visit_number;
 ```
 
 Default resources are resolved automatically for:

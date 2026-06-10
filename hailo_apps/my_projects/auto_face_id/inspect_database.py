@@ -41,7 +41,7 @@ def main() -> None:
     for record in records:
         print(
             f"- {record['label']}: global_id={record['global_id']} "
-            f"samples={len(record['samples_json'])}"
+            f"samples={len(record['samples_json'])} visits={len(record.get('visits_json') or [])}"
         )
 
 
