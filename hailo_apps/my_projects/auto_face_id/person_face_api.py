@@ -47,6 +47,7 @@ class PersonCard(BaseModel):
     global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
     label: str = Field(..., examples=["person_1"])
     visit_count: int = Field(..., examples=[4])
+    entered: int = Field(..., examples=[2])
     last_seen_at: int | None = Field(default=None, examples=[1717500000])
     thumbnail_name: str | None = Field(default=None, examples=["abc123.jpeg"])
     thumbnail_url: str | None = Field(
@@ -58,6 +59,59 @@ class PersonCard(BaseModel):
 
 class PeopleResponse(BaseModel):
     people: list[PersonCard]
+    count: int = Field(..., examples=[1])
+
+
+class PersonPhotoRef(BaseModel):
+    kind: str = Field(..., examples=["face_sample"])
+    id: str | None = Field(default=None, examples=["sample-1"])
+    timestamp: int | None = Field(default=None, examples=[1717500000])
+    photo_name: str | None = Field(default=None, examples=["person_1/abc123.jpeg"])
+    photo_url: str | None = Field(
+        default=None,
+        examples=["http://127.0.0.1:8000/samples/person_1/abc123.jpeg"],
+    )
+    visit_number: int | None = Field(default=None, examples=[1])
+    track_id: int | None = Field(default=None, examples=[12])
+
+
+class EntryEventRef(BaseModel):
+    id: str = Field(..., examples=["entry-1"])
+    status: str = Field(..., examples=["confirmed"])
+    detected_at: int = Field(..., examples=[1717500000])
+    confirmed_at: int | None = Field(default=None, examples=[1717500003])
+    track_id: int | None = Field(default=None, examples=[12])
+    global_id: str | None = Field(default=None, examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
+    label: str = Field(..., examples=["person_1"])
+    entry_photo_url: str | None = Field(
+        default=None,
+        examples=["http://127.0.0.1:8000/samples/_entries/entry-1/entry.jpeg"],
+    )
+    confirmed_photo_url: str | None = Field(
+        default=None,
+        examples=["http://127.0.0.1:8000/samples/_entries/entry-1/confirmed.jpeg"],
+    )
+    frame_number: int | None = Field(default=None, examples=[431])
+    point_x: float | None = Field(default=None, examples=[0.52])
+    point_y: float | None = Field(default=None, examples=[0.78])
+
+
+class EntryStatsResponse(BaseModel):
+    total_entered: int = Field(..., examples=[12])
+    entries: list[EntryEventRef]
+
+
+class EnteredPersonCard(PersonCard):
+    entry_event_id: str = Field(..., examples=["entry-1"])
+    entered_at: int | None = Field(default=None, examples=[1717500003])
+    track_id: int | None = Field(default=None, examples=[12])
+    photos: list[PersonPhotoRef]
+    entry_event: EntryEventRef
+
+
+class EnteredPeopleResponse(BaseModel):
+    entered_people: list[EnteredPersonCard]
+    total_entered: int = Field(..., examples=[12])
     count: int = Field(..., examples=[1])
 
 
@@ -87,6 +141,7 @@ class PersonDetails(BaseModel):
     global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
     label: str = Field(..., examples=["person_1"])
     visit_count: int = Field(..., examples=[4])
+    entered: int = Field(..., examples=[2])
     last_seen_at: int | None = Field(default=None, examples=[1717500000])
     last_seen_track_id: int | None = Field(default=None, examples=[12])
     samples: list[SampleRef]
@@ -106,11 +161,17 @@ class DeletePersonResponse(BaseModel):
 
 class EventPayload(BaseModel):
     event: str = Field(..., examples=["recognized"])
-    global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
+    global_id: str | None = Field(
+        default=None,
+        examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"],
+    )
     label: str = Field(..., examples=["person_1"])
     track_id: int = Field(..., examples=[12])
     confidence: float = Field(..., examples=[0.91])
     visit_count: int | None = Field(default=None, examples=[4])
+    entered: int | None = Field(default=None, examples=[2])
+    entry_event_id: str | None = Field(default=None, examples=["entry-1"])
+    total_entered: int | None = Field(default=None, examples=[12])
     timestamp: int = Field(..., examples=[1717500000])
 
 
@@ -130,6 +191,7 @@ PEOPLE_EXAMPLE = {
             "global_id": "3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1",
             "label": "person_1",
             "visit_count": 4,
+            "entered": 2,
             "last_seen_at": 1717500000,
             "thumbnail_name": "abc123.jpeg",
             "thumbnail_url": "http://127.0.0.1:8000/samples/abc123.jpeg",
@@ -138,11 +200,62 @@ PEOPLE_EXAMPLE = {
     ],
     "count": 1,
 }
+ENTRY_STATS_EXAMPLE = {
+    "total_entered": 12,
+    "entries": [
+        {
+            "id": "entry-1",
+            "status": "confirmed",
+            "detected_at": 1717500000,
+            "confirmed_at": 1717500003,
+            "track_id": 12,
+            "global_id": "3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1",
+            "label": "person_1",
+            "entry_photo_url": "http://127.0.0.1:8000/samples/_entries/entry-1/entry.jpeg",
+            "confirmed_photo_url": "http://127.0.0.1:8000/samples/_entries/entry-1/confirmed.jpeg",
+            "frame_number": 431,
+            "point_x": 0.52,
+            "point_y": 0.78,
+        }
+    ],
+}
+ENTERED_PEOPLE_EXAMPLE = {
+    "entered_people": [
+        {
+            "entry_event_id": "entry-1",
+            "entered_at": 1717500003,
+            "track_id": 12,
+            "global_id": "3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1",
+            "label": "person_1",
+            "visit_count": 4,
+            "entered": 2,
+            "last_seen_at": 1717500000,
+            "thumbnail_name": "person_1/abc123.jpeg",
+            "thumbnail_url": "http://127.0.0.1:8000/samples/person_1/abc123.jpeg",
+            "sample_count": 5,
+            "photos": [
+                {
+                    "kind": "face_sample",
+                    "id": "sample-1",
+                    "timestamp": 1717500000,
+                    "photo_name": "person_1/abc123.jpeg",
+                    "photo_url": "http://127.0.0.1:8000/samples/person_1/abc123.jpeg",
+                    "visit_number": None,
+                    "track_id": None,
+                }
+            ],
+            "entry_event": ENTRY_STATS_EXAMPLE["entries"][0],
+        }
+    ],
+    "total_entered": 12,
+    "count": 1,
+}
 PERSON_EXAMPLE = {
     "person": {
         "global_id": "3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1",
         "label": "person_1",
         "visit_count": 4,
+        "entered": 2,
         "last_seen_at": 1717500000,
         "last_seen_track_id": 12,
         "samples": [
@@ -173,6 +286,9 @@ EVENT_EXAMPLE = {
     "track_id": 12,
     "confidence": 0.91,
     "visit_count": 4,
+    "entered": 2,
+    "entry_event_id": "entry-1",
+    "total_entered": 12,
     "timestamp": 1717500000,
 }
 DELETE_PERSON_EXAMPLE = {
@@ -235,6 +351,116 @@ def _absolute_url(request: Request, path: str | None) -> str | None:
     if not path:
         return None
     return str(request.base_url).rstrip("/") + path
+
+
+def _sample_name(sample_path: str | None) -> str | None:
+    sample_url = _sample_url(sample_path)
+    if sample_url is None:
+        return None
+    return sample_url.removeprefix("/samples/")
+
+
+def _sample_absolute_url(request: Request, sample_path: str | None) -> str | None:
+    return _absolute_url(request, _sample_url(sample_path))
+
+
+def _event_photo_url(request: Request | None, sample_path: str | None) -> str | None:
+    relative_url = _sample_url(sample_path)
+    if request is None:
+        return relative_url
+    return _absolute_url(request, relative_url)
+
+
+def _entry_event_response(
+    event: dict[str, Any],
+    request: Request | None = None,
+) -> dict[str, Any]:
+    response = dict(event)
+    response["entry_photo_url"] = _event_photo_url(
+        request,
+        response.pop("entry_photo_path", None),
+    )
+    response["confirmed_photo_url"] = _event_photo_url(
+        request,
+        response.pop("confirmed_photo_path", None),
+    )
+    return response
+
+
+def _person_card_response(person: dict[str, Any], request: Request) -> dict[str, Any]:
+    thumbnail_name = None
+    thumbnail_url = None
+    samples = person.get("samples_json") or []
+    if samples:
+        thumbnail_path = samples[0].get("sample_path")
+        thumbnail_name = _sample_name(thumbnail_path)
+        thumbnail_url = _sample_absolute_url(request, thumbnail_path)
+
+    return {
+        "global_id": person["global_id"],
+        "label": person["label"],
+        "visit_count": int(person["visit_count"]),
+        "entered": int(person["entered"]),
+        "last_seen_at": person.get("last_seen_at"),
+        "thumbnail_name": thumbnail_name,
+        "thumbnail_url": thumbnail_url,
+        "sample_count": len(samples),
+    }
+
+
+def _person_photo_refs(person: dict[str, Any], request: Request) -> list[dict[str, Any]]:
+    photos = []
+    for sample in person.get("samples_json") or []:
+        sample_path = sample.get("sample_path")
+        if not sample_path:
+            continue
+        photos.append(
+            {
+                "kind": "face_sample",
+                "id": sample.get("id"),
+                "timestamp": sample.get("timestamp"),
+                "photo_name": _sample_name(sample_path),
+                "photo_url": _sample_absolute_url(request, sample_path),
+                "visit_number": None,
+                "track_id": None,
+            }
+        )
+
+    for visit in person.get("visits_json") or []:
+        photo_path = visit.get("photo_path")
+        if not photo_path:
+            continue
+        photos.append(
+            {
+                "kind": "visit",
+                "id": visit.get("id"),
+                "timestamp": visit.get("timestamp"),
+                "photo_name": _sample_name(photo_path),
+                "photo_url": _sample_absolute_url(request, photo_path),
+                "visit_number": visit.get("visit_number"),
+                "track_id": visit.get("track_id"),
+            }
+        )
+    return photos
+
+
+def _entered_person_response(
+    event: dict[str, Any],
+    person: dict[str, Any],
+    request: Request,
+) -> dict[str, Any]:
+    card = _person_card_response(person, request)
+    entry_event = _entry_event_response(event, request)
+    card.update(
+        {
+            "entry_event_id": event["id"],
+            "entered_at": event.get("confirmed_at") or event.get("detected_at"),
+            "track_id": event.get("track_id"),
+            "photos": _person_photo_refs(person, request),
+            "entry_event": entry_event,
+        }
+    )
+    return card
 
 
 class WebSocketManager:
@@ -324,6 +550,49 @@ def list_people(request: Request) -> PeopleResponse:
 
 
 @app.get(
+    "/api/entries",
+    response_model=EntryStatsResponse,
+    responses={200: {"content": {"application/json": {"example": ENTRY_STATS_EXAMPLE}}}},
+)
+def list_entry_events(request: Request, limit: int = 100) -> EntryStatsResponse:
+    db = _db(request)
+    return {
+        "total_entered": db.get_total_entered(),
+        "entries": [
+            _entry_event_response(event, request)
+            for event in db.get_entry_events(limit=limit)
+        ],
+    }
+
+
+@app.get(
+    "/api/entered-people",
+    response_model=EnteredPeopleResponse,
+    responses={200: {"content": {"application/json": {"example": ENTERED_PEOPLE_EXAMPLE}}}},
+)
+def list_entered_people(request: Request, limit: int = 100) -> EnteredPeopleResponse:
+    db = _db(request)
+    entry_limit = None if limit <= 0 else limit
+    entered_people = []
+    for event in db.get_entry_events(limit=entry_limit):
+        if event.get("status") != "confirmed":
+            continue
+        global_id = event.get("global_id")
+        if not global_id:
+            continue
+        person = db.get_record_by_id(global_id)
+        if person is None:
+            continue
+        entered_people.append(_entered_person_response(event, person, request))
+
+    return {
+        "entered_people": entered_people,
+        "total_entered": db.get_total_entered(),
+        "count": len(entered_people),
+    }
+
+
+@app.get(
     "/api/people/{global_id}",
     response_model=PersonResponse,
     responses={200: {"content": {"application/json": {"example": PERSON_EXAMPLE}}}},
@@ -361,6 +630,7 @@ def get_person(global_id: str, request: Request) -> PersonResponse:
             "global_id": person["global_id"],
             "label": person["label"],
             "visit_count": person["visit_count"],
+            "entered": person["entered"],
             "last_seen_at": person.get("last_seen_at"),
             "last_seen_track_id": person.get("last_seen_track_id"),
             "samples": samples,
@@ -426,10 +696,16 @@ def get_sample(sample_path: str) -> FileResponse:
 )
 async def receive_event(payload: EventPayload, request: Request) -> EventAck:
     logger.info("Event received: %s", payload)
+    data = payload.model_dump()
+    if payload.entry_event_id:
+        entry_event = _db(request).get_entry_event_by_id(payload.entry_event_id)
+        if entry_event is not None:
+            data["entry_event"] = _entry_event_response(entry_event, request)
+            data["total_entered"] = _db(request).get_total_entered()
     await _ws_manager(request).broadcast(
         {
             "type": payload.event,
-            "data": payload.model_dump(),
+            "data": data,
         }
     )
     return {"ok": True}
@@ -444,6 +720,11 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
                 "type": "init",
                 "data": {
                     "people": websocket.app.state.db.get_people_cards(),
+                    "total_entered": websocket.app.state.db.get_total_entered(),
+                    "entries": [
+                        _entry_event_response(event)
+                        for event in websocket.app.state.db.get_entry_events(limit=100)
+                    ],
                 },
             }
         )

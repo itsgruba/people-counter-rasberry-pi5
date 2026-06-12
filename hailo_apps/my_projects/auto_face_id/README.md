@@ -37,7 +37,7 @@ The display stays intentionally simple:
 - an unidentified person box is labeled `Unknown`
 - a recognized or newly enrolled person box is labeled with a simple ID such as `person_1`
 
-## Run
+нк## Run
 
 From the repository root:
 

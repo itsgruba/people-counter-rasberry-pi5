@@ -34,10 +34,13 @@ def _print_summary(db: SQLiteDatabaseHandler) -> None:
     records = db.get_all_records()
     print(f"Database: {db.db_path}")
     print(f"Total people: {len(records)}")
+    print(f"Total entered: {db.get_total_entered()}")
     for record in records:
         print(
             f"- {record['label']}: global_id={record['global_id']} "
-            f"samples={len(record['samples_json'])} visits={len(record.get('visits_json') or [])}"
+            f"samples={len(record['samples_json'])} "
+            f"visits={len(record.get('visits_json') or [])} "
+            f"entered={record.get('entered', 0)}"
         )
 
 
@@ -66,6 +69,11 @@ def _sample_files_in_use(db: SQLiteDatabaseHandler) -> set[Path]:
                 files.add(Path(sample_path).resolve())
         for visit in record.get("visits_json") or []:
             photo_path = visit.get("photo_path")
+            if photo_path:
+                files.add(Path(photo_path).resolve())
+    for event in db.get_entry_events(limit=1000):
+        for key in ("entry_photo_path", "confirmed_photo_path"):
+            photo_path = event.get(key)
             if photo_path:
                 files.add(Path(photo_path).resolve())
     return files

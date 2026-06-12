@@ -38,10 +38,13 @@ def main() -> None:
     records = db.get_all_records()
     print(f"Database: {db.db_path}")
     print(f"Total people: {len(records)}")
+    print(f"Total entered: {db.get_total_entered()}")
     for record in records:
         print(
             f"- {record['label']}: global_id={record['global_id']} "
-            f"samples={len(record['samples_json'])} visits={len(record.get('visits_json') or [])}"
+            f"samples={len(record['samples_json'])} "
+            f"visits={len(record.get('visits_json') or [])} "
+            f"entered={record.get('entered', 0)}"
         )
 
 

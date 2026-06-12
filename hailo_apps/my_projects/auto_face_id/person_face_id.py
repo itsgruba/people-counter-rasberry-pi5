@@ -119,6 +119,194 @@ class PendingIdentity:
     first_seen_time: float = field(default_factory=time.time)
 
 
+@dataclass
+class EntryEvent:
+    """One completed A -> B line crossing for a person track."""
+
+    entry_event_id: str
+    track_id: int
+    entered_at: int
+    frame_number: int
+    point: tuple[float, float]
+
+
+@dataclass
+class EntryTrackState:
+    """Line-crossing state keyed by the Hailo person tracker ID."""
+
+    last_side_a: int | None = None
+    last_side_b: int | None = None
+    stage: str = "outside"
+    crossed_a_frame: int | None = None
+    crossed_a_at: int | None = None
+    entry_event_id: str | None = None
+    entered_frame: int | None = None
+    entered_at: int | None = None
+    entered_global_id: str | None = None
+    last_seen_at: float = field(default_factory=time.time)
+    last_frame: int = 0
+    last_point: tuple[float, float] | None = None
+
+
+class EntryDetector:
+    """Detect a completed entry when a track crosses line A and then line B."""
+
+    def __init__(
+        self,
+        line_a_y: float,
+        line_b_y: float,
+        margin: float,
+        track_ttl_seconds: float,
+        min_frames_between_lines: int,
+    ) -> None:
+        self.line_a_y = line_a_y
+        self.line_b_y = line_b_y
+        self.margin = max(0.0, margin)
+        self.track_ttl_seconds = max(0.0, track_ttl_seconds)
+        self.min_frames_between_lines = max(0, min_frames_between_lines)
+        self.tracks: dict[int, EntryTrackState] = {}
+
+    @staticmethod
+    def anchor_point(detection) -> tuple[float, float]:
+        bbox = detection.get_bbox()
+        return (bbox.xmin() + bbox.xmax()) / 2.0, bbox.ymax()
+
+    def _side(self, value: float, line_y: float) -> int:
+        if value < line_y - self.margin:
+            return -1
+        if value > line_y + self.margin:
+            return 1
+        return 0
+
+    def _update_side(
+        self,
+        previous_side: int | None,
+        value: float,
+        line_y: float,
+    ) -> tuple[int | None, bool]:
+        current_side = self._side(value, line_y)
+        if current_side == 0:
+            return previous_side, False
+        if previous_side is None:
+            return current_side, False
+        if previous_side != current_side:
+            return current_side, True
+        return previous_side, False
+
+    @staticmethod
+    def _line_cross_order(
+        previous_y: float,
+        current_y: float,
+        first_line_y: float,
+        second_line_y: float,
+    ) -> bool:
+        delta_y = current_y - previous_y
+        if abs(delta_y) <= 1e-12:
+            return True
+        first_t = (first_line_y - previous_y) / delta_y
+        second_t = (second_line_y - previous_y) / delta_y
+        return first_t <= second_t
+
+    def update(
+        self,
+        track_id: int,
+        detection,
+        frame_number: int,
+        timestamp: int,
+    ) -> EntryEvent | None:
+        point = self.anchor_point(detection)
+        state = self.tracks.setdefault(track_id, EntryTrackState())
+        previous_point = state.last_point
+        state.last_seen_at = time.time()
+        state.last_frame = frame_number
+
+        new_side_a, crossed_a = self._update_side(state.last_side_a, point[1], self.line_a_y)
+        new_side_b, crossed_b = self._update_side(state.last_side_b, point[1], self.line_b_y)
+        state.last_side_a = new_side_a
+        state.last_side_b = new_side_b
+        crossed_a_before_b = True
+        if crossed_a and crossed_b and previous_point is not None:
+            crossed_a_before_b = self._line_cross_order(
+                previous_point[1],
+                point[1],
+                self.line_a_y,
+                self.line_b_y,
+            )
+
+        if crossed_a and state.stage != "entered":
+            state.stage = "crossed_a"
+            state.crossed_a_frame = frame_number
+            state.crossed_a_at = timestamp
+
+        enough_frames = (
+            state.crossed_a_frame is not None
+            and frame_number - state.crossed_a_frame >= self.min_frames_between_lines
+        )
+        if crossed_b and state.stage == "crossed_a" and enough_frames and crossed_a_before_b:
+            state.stage = "entered"
+            state.entry_event_id = state.entry_event_id or str(uuid.uuid4())
+            state.entered_frame = frame_number
+            state.entered_at = timestamp
+            state.last_point = point
+            return EntryEvent(
+                entry_event_id=state.entry_event_id,
+                track_id=track_id,
+                entered_at=timestamp,
+                frame_number=frame_number,
+                point=point,
+            )
+
+        state.last_point = point
+        return None
+
+    def mark_entry_counted(self, track_id: int, global_id: str) -> None:
+        state = self.tracks.get(track_id)
+        if state is not None and state.entered_at is not None:
+            state.entered_global_id = global_id
+
+    def has_uncounted_entry(self, track_id: int) -> bool:
+        state = self.tracks.get(track_id)
+        return (
+            state is not None
+            and state.entered_at is not None
+            and state.entry_event_id is not None
+            and state.entered_global_id is None
+        )
+
+    def uncounted_entry_event(self, track_id: int) -> EntryEvent | None:
+        state = self.tracks.get(track_id)
+        if (
+            state is None
+            or state.entry_event_id is None
+            or state.entered_at is None
+            or state.entered_frame is None
+            or state.entered_global_id is not None
+        ):
+            return None
+        return EntryEvent(
+            entry_event_id=state.entry_event_id,
+            track_id=track_id,
+            entered_at=state.entered_at,
+            frame_number=state.entered_frame,
+            point=state.last_point or (0.0, 0.0),
+        )
+
+    def cleanup(self, active_track_ids: set[int]) -> None:
+        if self.track_ttl_seconds <= 0:
+            return
+        now = time.time()
+        expired_track_ids = [
+            track_id
+            for track_id, state in self.tracks.items()
+            if (
+                track_id not in active_track_ids
+                and now - state.last_seen_at >= self.track_ttl_seconds
+            )
+        ]
+        for track_id in expired_track_ids:
+            self.tracks.pop(track_id, None)
+
+
 class PersonFaceIdData(app_callback_class):
     """Shared state for the GStreamer callback."""
 
@@ -192,7 +380,7 @@ class PersonFaceIdApp(GStreamerApp):
         )
         self.enroll_zone = self._parse_enroll_zone(self.options_menu.enroll_zone)
         self.enroll_zone_file = (
-            Path(self.options_menu.enroll_zone_file).expanduser()
+            self._resolve_live_config_path(self.options_menu.enroll_zone_file)
             if self.options_menu.enroll_zone_file
             else None
         )
@@ -218,6 +406,23 @@ class PersonFaceIdApp(GStreamerApp):
         self.low_latency_enabled = not self.options_menu.disable_low_latency
         self.low_latency_queue_size = max(1, self.options_menu.low_latency_queue_size)
         self.pipeline_latency = max(0, self.options_menu.pipeline_latency_ms)
+        self._validate_entry_options()
+        self.entry_counter_enabled = not self.options_menu.disable_entry_counter
+        self.entry_detector = EntryDetector(
+            line_a_y=self.options_menu.entry_line_a_y,
+            line_b_y=self.options_menu.entry_line_b_y,
+            margin=self.options_menu.entry_line_margin,
+            track_ttl_seconds=self.options_menu.entry_track_ttl_seconds,
+            min_frames_between_lines=self.options_menu.entry_min_frames_between_lines,
+        )
+        self.entry_lines_file = (
+            self._resolve_live_config_path(self.options_menu.entry_lines_file)
+            if self.options_menu.entry_lines_file
+            else self.enroll_zone_file
+        )
+        self.entry_lines_file_explicit = self.options_menu.entry_lines_file is not None
+        self._entry_lines_file_mtime: float | None = None
+        self._reload_entry_lines_file(force=True)
         self._shutdown_started = False
         self._debug_fps = 0.0
         self._debug_fps_frames = 0
@@ -324,6 +529,9 @@ class PersonFaceIdApp(GStreamerApp):
         self.track_to_label: dict[int, str] = {}
         self.last_printed_identity: dict[int, str] = {}
         self.recognition_stats = self._new_recognition_stats()
+        self.entered_people: list[dict] = []
+        self.entered_people_by_entry_event_id: dict[str, dict] = {}
+        self._load_entered_people()
         self.next_person_index = self._load_next_person_index()
 
         self.app_callback = self.pipeline_callback
@@ -331,6 +539,14 @@ class PersonFaceIdApp(GStreamerApp):
         logger.info("Person-face database: %s", self.database_dir / DB_NAME)
         logger.info("Person-face samples: %s", self.samples_dir)
         logger.info("Person-face database records: %d", len(self.db_handler.get_all_records()))
+        logger.info("Loaded entered_people records: %d", len(self.entered_people))
+        if self.entry_counter_enabled:
+            logger.info(
+                "Entry counter enabled: line_a_y=%.3f line_b_y=%.3f margin=%.3f",
+                self.entry_detector.line_a_y,
+                self.entry_detector.line_b_y,
+                self.entry_detector.margin,
+            )
 
         if self.options_menu.disable_local_display:
             self.video_sink = "fakesink"
@@ -497,6 +713,50 @@ class PersonFaceIdApp(GStreamerApp):
             ),
         )
         parser.add_argument(
+            "--disable-entry-counter",
+            action="store_true",
+            help="Disable A -> B entry counting for tracked people.",
+        )
+        parser.add_argument(
+            "--entry-line-a-y",
+            type=float,
+            default=0.55,
+            help="Normalized Y coordinate for entry line A. Default: 0.55.",
+        )
+        parser.add_argument(
+            "--entry-line-b-y",
+            type=float,
+            default=0.75,
+            help="Normalized Y coordinate for entry line B. Default: 0.75.",
+        )
+        parser.add_argument(
+            "--entry-line-margin",
+            type=float,
+            default=0.02,
+            help="Normalized hysteresis margin around each entry line. Default: 0.02.",
+        )
+        parser.add_argument(
+            "--entry-track-ttl-seconds",
+            type=float,
+            default=60.0,
+            help="Seconds to keep entry state for disappeared tracks. Default: 60.",
+        )
+        parser.add_argument(
+            "--entry-min-frames-between-lines",
+            type=int,
+            default=0,
+            help="Minimum frame gap between crossing line A and line B. Default: 0.",
+        )
+        parser.add_argument(
+            "--entry-lines-file",
+            default=None,
+            help=(
+                "Optional text file reloaded while the app is running. Supports "
+                "entry_line_a_y=0.55, entry_line_b_y=0.75, entry_line_margin=0.02. "
+                "If omitted, the app also looks for those keys in --enroll-zone-file."
+            ),
+        )
+        parser.add_argument(
             "--disable-debug-stream",
             action="store_true",
             help="Disable the built-in Flask MJPEG debug stream.",
@@ -560,6 +820,44 @@ class PersonFaceIdApp(GStreamerApp):
         return parser
 
     @staticmethod
+    def _resolve_live_config_path(value: str) -> Path:
+        path = Path(value).expanduser()
+        if path.is_absolute() or path.exists():
+            return path
+
+        project_relative_path = PROJECT_DIR / path
+        if project_relative_path.exists():
+            return project_relative_path
+
+        return path
+
+    def _validate_entry_options(self) -> None:
+        self._validate_entry_values(
+            self.options_menu.entry_line_a_y,
+            self.options_menu.entry_line_b_y,
+            self.options_menu.entry_line_margin,
+        )
+
+        if self.options_menu.entry_track_ttl_seconds < 0:
+            raise ValueError("--entry-track-ttl-seconds must be >= 0.")
+        if self.options_menu.entry_min_frames_between_lines < 0:
+            raise ValueError("--entry-min-frames-between-lines must be >= 0.")
+
+    @staticmethod
+    def _validate_entry_values(line_a_y: float, line_b_y: float, margin: float) -> None:
+        values = {
+            "entry-line-a-y": line_a_y,
+            "entry-line-b-y": line_b_y,
+            "entry-line-margin": margin,
+        }
+        for cli_name, value in values.items():
+            if not 0.0 <= value <= 1.0:
+                raise ValueError(f"--{cli_name} must be normalized from 0.0 to 1.0.")
+
+        if line_a_y == line_b_y:
+            raise ValueError("--entry-line-a-y and --entry-line-b-y must be different.")
+
+    @staticmethod
     def _parse_enroll_zone(value: str | None) -> list[tuple[float, float]] | None:
         if value is None or not value.strip():
             return None
@@ -594,9 +892,55 @@ class PersonFaceIdApp(GStreamerApp):
             if not line or line.startswith("#"):
                 continue
             if "=" in line:
-                line = line.split("=", 1)[1].strip()
+                key, value = line.split("=", 1)
+                key = key.strip().lower().replace("-", "_")
+                if key in {"entry_line_a_y", "entry_line_b_y", "entry_line_margin"}:
+                    continue
+                line = value.strip()
             return line
         return None
+
+    @staticmethod
+    def _read_entry_lines_file(path: Path) -> dict[str, float] | None:
+        values: dict[str, float] = {}
+        aliases = {
+            "entry_line_a_y": "entry_line_a_y",
+            "line_a_y": "entry_line_a_y",
+            "line_a": "entry_line_a_y",
+            "a": "entry_line_a_y",
+            "entry_line_b_y": "entry_line_b_y",
+            "line_b_y": "entry_line_b_y",
+            "line_b": "entry_line_b_y",
+            "b": "entry_line_b_y",
+            "entry_line_margin": "entry_line_margin",
+            "line_margin": "entry_line_margin",
+            "margin": "entry_line_margin",
+        }
+
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if "=" in line:
+                key, raw_value = line.split("=", 1)
+                key = key.strip().lower().replace("-", "_")
+                target_key = aliases.get(key)
+                if target_key is None:
+                    continue
+                values[target_key] = float(raw_value.strip())
+                continue
+
+            try:
+                coordinates = [float(part.strip()) for part in line.split(",")]
+            except ValueError:
+                continue
+            if 2 <= len(coordinates) <= 3:
+                values["entry_line_a_y"] = coordinates[0]
+                values["entry_line_b_y"] = coordinates[1]
+                if len(coordinates) == 3:
+                    values["entry_line_margin"] = coordinates[2]
+
+        return values or None
 
     def _reload_enroll_zone_file(self, force: bool = False) -> None:
         if self.enroll_zone_file is None:
@@ -620,6 +964,48 @@ class PersonFaceIdApp(GStreamerApp):
         except (OSError, ValueError) as exc:
             self._enroll_zone_file_mtime = mtime
             logger.warning("Keeping previous enrollment zone; failed to read %s: %s", self.enroll_zone_file, exc)
+
+    def _reload_entry_lines_file(self, force: bool = False) -> None:
+        if self.entry_lines_file is None:
+            return
+
+        try:
+            mtime = self.entry_lines_file.stat().st_mtime
+        except OSError as exc:
+            if force and self.entry_lines_file_explicit:
+                logger.warning("Entry lines file is not readable: %s (%s)", self.entry_lines_file, exc)
+            return
+
+        if not force and self._entry_lines_file_mtime == mtime:
+            return
+
+        try:
+            values = self._read_entry_lines_file(self.entry_lines_file)
+            self._entry_lines_file_mtime = mtime
+            if not values:
+                return
+
+            line_a_y = values.get("entry_line_a_y", self.entry_detector.line_a_y)
+            line_b_y = values.get("entry_line_b_y", self.entry_detector.line_b_y)
+            margin = values.get("entry_line_margin", self.entry_detector.margin)
+            self._validate_entry_values(line_a_y, line_b_y, margin)
+            self.entry_detector.line_a_y = line_a_y
+            self.entry_detector.line_b_y = line_b_y
+            self.entry_detector.margin = margin
+            logger.info(
+                "Reloaded entry lines from %s: line_a_y=%.3f line_b_y=%.3f margin=%.3f",
+                self.entry_lines_file,
+                line_a_y,
+                line_b_y,
+                margin,
+            )
+        except (OSError, ValueError) as exc:
+            self._entry_lines_file_mtime = mtime
+            logger.warning(
+                "Keeping previous entry lines; failed to read %s: %s",
+                self.entry_lines_file,
+                exc,
+            )
 
     def _start_debug_stream_server(self) -> None:
         try:
@@ -820,6 +1206,89 @@ class PersonFaceIdApp(GStreamerApp):
             track_id=track_id,
         )
 
+    @staticmethod
+    def _person_photo_refs(person: dict) -> list[dict]:
+        """Return all stored photo references that belong to a person record."""
+        photos = []
+        for sample in person.get("samples_json") or []:
+            sample_path = sample.get("sample_path")
+            if not sample_path:
+                continue
+            photos.append(
+                {
+                    "kind": "face_sample",
+                    "id": sample.get("id"),
+                    "path": sample_path,
+                    "timestamp": sample.get("timestamp"),
+                }
+            )
+
+        for visit in person.get("visits_json") or []:
+            photo_path = visit.get("photo_path")
+            if not photo_path:
+                continue
+            photos.append(
+                {
+                    "kind": "visit",
+                    "id": visit.get("id"),
+                    "path": photo_path,
+                    "timestamp": visit.get("timestamp"),
+                    "visit_number": visit.get("visit_number"),
+                    "track_id": visit.get("track_id"),
+                }
+            )
+        return photos
+
+    def _make_entered_people_item(self, person: dict, entry_event: dict) -> dict:
+        """Create one entered_people item with an explicit entry -> person link."""
+        return {
+            "entry_event_id": entry_event["id"],
+            "entered_at": entry_event.get("confirmed_at") or entry_event.get("detected_at"),
+            "track_id": entry_event.get("track_id"),
+            "person_global_id": person["global_id"],
+            "person_label": person["label"],
+            "person": person,
+            "photos": self._person_photo_refs(person),
+            "entry_event": entry_event,
+        }
+
+    def _remember_entered_person(
+        self,
+        person: dict,
+        entry_event: dict | None = None,
+    ) -> None:
+        """Add or refresh one confirmed entered person in memory."""
+        entry_event = entry_event or person.get("entry_event")
+        if not entry_event or not entry_event.get("id"):
+            return
+        if entry_event.get("status") != "confirmed":
+            return
+
+        item = self._make_entered_people_item(person, entry_event)
+        entry_event_id = item["entry_event_id"]
+        self.entered_people_by_entry_event_id[entry_event_id] = item
+
+        for index, existing_item in enumerate(self.entered_people):
+            if existing_item.get("entry_event_id") == entry_event_id:
+                self.entered_people[index] = item
+                return
+        self.entered_people.append(item)
+
+    def _load_entered_people(self) -> None:
+        """Restore confirmed entries as entered_people links from SQLite."""
+        self.entered_people.clear()
+        self.entered_people_by_entry_event_id.clear()
+        for entry_event in self.db_handler.get_entry_events(limit=None):
+            if entry_event.get("status") != "confirmed":
+                continue
+            global_id = entry_event.get("global_id")
+            if not global_id:
+                continue
+            person = self.db_handler.get_record_by_id(global_id)
+            if person is None:
+                continue
+            self._remember_entered_person(person, entry_event)
+
     def _record_visit_snapshot(
         self,
         person: dict,
@@ -860,11 +1329,14 @@ class PersonFaceIdApp(GStreamerApp):
     def _notify_frontend(
         self,
         event: str,
-        global_id: str,
+        global_id: str | None,
         label: str,
         track_id: int,
         confidence: float,
         visit_count: int | None = None,
+        entered: int | None = None,
+        entry_event_id: str | None = None,
+        total_entered: int | None = None,
     ) -> None:
         """Send a best-effort JSON event to an optional frontend/backend endpoint."""
         if not self.notify_url:
@@ -877,6 +1349,9 @@ class PersonFaceIdApp(GStreamerApp):
             "track_id": track_id,
             "confidence": confidence,
             "visit_count": visit_count,
+            "entered": entered,
+            "entry_event_id": entry_event_id,
+            "total_entered": total_entered,
             "timestamp": int(time.time()),
         }
         request = urllib.request.Request(
@@ -890,6 +1365,144 @@ class PersonFaceIdApp(GStreamerApp):
                 pass
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             logger.debug("Failed to notify %s: %s", self.notify_url, exc)
+
+    def _handle_entry_event(
+        self,
+        event: EntryEvent,
+        person_detection,
+        frame: np.ndarray | None,
+        width: int | None,
+        height: int | None,
+    ) -> None:
+        entry_photo_path = self._save_entry_snapshot(
+            entry_event_id=event.entry_event_id,
+            kind="entry",
+            timestamp=event.entered_at,
+            track_id=event.track_id,
+            frame=frame,
+            detection=person_detection,
+            width=width,
+            height=height,
+        )
+        pending_event = self.db_handler.register_entry_pending(
+            entry_event_id=event.entry_event_id,
+            timestamp=event.entered_at,
+            track_id=event.track_id,
+            frame_number=event.frame_number,
+            point=event.point,
+            entry_photo_path=entry_photo_path,
+        )
+        label = self.track_to_label.get(event.track_id, "Unknown")
+        global_id = self.track_to_global_id.get(event.track_id)
+        if global_id is None:
+            print(
+                f"entered-pending: entry_event_id={event.entry_event_id} "
+                f"track_id={event.track_id} label=Unknown"
+            )
+            self._notify_frontend(
+                "entered_pending",
+                None,
+                "Unknown",
+                event.track_id,
+                0.0,
+                entry_event_id=event.entry_event_id,
+                total_entered=pending_event.get("total_entered"),
+            )
+            return
+
+        self._mark_known_person_entered(
+            global_id=global_id,
+            label=label,
+            track_id=event.track_id,
+            confidence=1.0,
+            entry_event=event,
+            person_detection=person_detection,
+            frame=frame,
+            width=width,
+            height=height,
+        )
+
+    def _mark_known_person_entered(
+        self,
+        global_id: str,
+        label: str,
+        track_id: int,
+        confidence: float,
+        entry_event: EntryEvent,
+        person_detection=None,
+        frame: np.ndarray | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        timestamp = int(time.time())
+        confirmed_photo_path = self._save_entry_snapshot(
+            entry_event_id=entry_event.entry_event_id,
+            kind="confirmed",
+            timestamp=timestamp,
+            track_id=track_id,
+            frame=frame,
+            detection=person_detection,
+            width=width,
+            height=height,
+        )
+        record = self.db_handler.mark_person_entered(
+            global_id=global_id,
+            timestamp=timestamp,
+            track_id=track_id,
+            entry_event_id=entry_event.entry_event_id,
+            detected_at=entry_event.entered_at,
+            frame_number=entry_event.frame_number,
+            point=entry_event.point,
+            confirmed_photo_path=confirmed_photo_path,
+        )
+        if record is None:
+            return
+
+        self.entry_detector.mark_entry_counted(track_id, global_id)
+        self._remember_entered_person(record)
+        entered = int(record.get("entered", 0))
+        total_entered = int(record.get("total_entered", 0))
+        print(
+            f"entered: entry_event_id={entry_event.entry_event_id} "
+            f"track_id={track_id} global_id={global_id} "
+            f"label={label} entered={entered} total_entered={total_entered}"
+        )
+        self._notify_frontend(
+            "entered",
+            global_id,
+            label,
+            track_id,
+            confidence,
+            entered=entered,
+            entry_event_id=entry_event.entry_event_id,
+            total_entered=total_entered,
+        )
+
+    def _apply_pending_entry_for_track(
+        self,
+        track_id: int,
+        global_id: str,
+        label: str,
+        confidence: float,
+        frame: np.ndarray | None = None,
+        person_detection=None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        entry_event = self.entry_detector.uncounted_entry_event(track_id)
+        if entry_event is None:
+            return
+        self._mark_known_person_entered(
+            global_id=global_id,
+            label=label,
+            track_id=track_id,
+            confidence=confidence,
+            entry_event=entry_event,
+            person_detection=person_detection,
+            frame=frame,
+            width=width,
+            height=height,
+        )
 
     def shutdown(self, signum=None, frame=None):
         """Prevent double shutdown and noisy HailoRT transfer errors on Ctrl-C."""
@@ -1048,6 +1661,57 @@ class PersonFaceIdApp(GStreamerApp):
         cv2.line(frame, (x - 12, y), (x + 12, y), color, 1)
         cv2.line(frame, (x, y - 12), (x, y + 12), color, 1)
 
+    def _draw_entry_lines(self, frame: np.ndarray, width: int, height: int) -> None:
+        if not self.entry_counter_enabled:
+            return
+
+        lines = [
+            ("A", self.entry_detector.line_a_y, (70, 180, 255)),
+            ("B", self.entry_detector.line_b_y, (255, 210, 70)),
+        ]
+        for name, y_norm, color in lines:
+            y = int(max(0.0, min(y_norm, 1.0)) * height)
+            cv2.line(frame, (0, y), (width - 1, y), color, 2)
+            cv2.putText(
+                frame,
+                f"LINE {name}",
+                (12, max(18, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+    def _draw_entry_anchor(
+        self,
+        frame: np.ndarray,
+        person_detection,
+        track_id: int | None,
+        width: int,
+        height: int,
+    ) -> None:
+        if not self.entry_counter_enabled or track_id is None:
+            return
+
+        point = self.entry_detector.anchor_point(person_detection)
+        x = int(max(0.0, min(point[0], 1.0)) * width)
+        y = int(max(0.0, min(point[1], 1.0)) * height)
+        state = self.entry_detector.tracks.get(track_id)
+        stage = state.stage if state is not None else "outside"
+        color = (60, 220, 120) if stage == "entered" else (70, 180, 255)
+        cv2.circle(frame, (x, y), 5, color, -1)
+        cv2.putText(
+            frame,
+            stage,
+            (min(width - 120, max(8, x + 8)), min(height - 8, max(18, y - 8))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
     def _update_debug_fps(self) -> None:
         self._debug_fps_frames += 1
         now = time.time()
@@ -1068,6 +1732,7 @@ class PersonFaceIdApp(GStreamerApp):
         frame_number: int,
     ) -> None:
         self._draw_enroll_zone(frame, width, height)
+        self._draw_entry_lines(frame, width, height)
 
         for person_detection in person_detections:
             track_id = self._get_track_id(person_detection)
@@ -1085,6 +1750,7 @@ class PersonFaceIdApp(GStreamerApp):
                 color=(255, 70, 70),
             )
             self._draw_enroll_anchor(frame, person_detection, width, height)
+            self._draw_entry_anchor(frame, person_detection, track_id, width, height)
 
         for face_detection in face_detections:
             track_id = self._get_track_id(face_detection)
@@ -1254,6 +1920,9 @@ class PersonFaceIdApp(GStreamerApp):
     def _visit_sample_dir(self, label: str, visit_number: int) -> Path:
         return self._person_sample_dir(label) / "visit_count" / f"visit_{visit_number}"
 
+    def _entry_event_sample_dir(self, entry_event_id: str) -> Path:
+        return self.samples_dir / "_entries" / entry_event_id
+
     def _cleanup_empty_sample_dirs(self, start_dir: Path) -> None:
         try:
             current = start_dir.resolve()
@@ -1319,6 +1988,29 @@ class PersonFaceIdApp(GStreamerApp):
         visit_dir = self._visit_sample_dir(label, visit_number)
         visit_dir.mkdir(parents=True, exist_ok=True)
         image_path = visit_dir / f"snapshot_{timestamp}_track_{track_id}.jpeg"
+        cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
+        if cropped.size == 0:
+            cropped = frame
+        self.save_image_file(cropped, str(image_path))
+        return str(image_path)
+
+    def _save_entry_snapshot(
+        self,
+        entry_event_id: str,
+        kind: str,
+        timestamp: int,
+        track_id: int,
+        frame: np.ndarray | None,
+        detection,
+        width: int | None,
+        height: int | None,
+    ) -> str | None:
+        if frame is None or detection is None or width is None or height is None:
+            return None
+
+        entry_dir = self._entry_event_sample_dir(entry_event_id)
+        entry_dir.mkdir(parents=True, exist_ok=True)
+        image_path = entry_dir / f"{kind}_{timestamp}_track_{track_id}.jpeg"
         cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
         if cropped.size == 0:
             cropped = frame
@@ -1452,6 +2144,16 @@ class PersonFaceIdApp(GStreamerApp):
             person["label"],
             confidence,
             state,
+        )
+        self._apply_pending_entry_for_track(
+            track_id,
+            person["global_id"],
+            person["label"],
+            confidence,
+            frame=frame,
+            person_detection=person_detection,
+            width=width,
+            height=height,
         )
         if updated_record and updated_record.get("visit_incremented"):
             self._record_visit_snapshot(
@@ -1696,6 +2398,16 @@ class PersonFaceIdApp(GStreamerApp):
             track_id,
         )
         self._print_identity(track_id, new_person["global_id"], label, 1.0, "enrolled")
+        self._apply_pending_entry_for_track(
+            track_id,
+            new_person["global_id"],
+            label,
+            1.0,
+            frame=frame,
+            person_detection=person_detection,
+            width=width,
+            height=height,
+        )
         self._record_visit_snapshot(
             new_person,
             track_id,
@@ -1798,6 +2510,35 @@ class PersonFaceIdApp(GStreamerApp):
             return pipeline_string
         return QUEUE_PATTERN.sub(self._low_latency_queue_config, pipeline_string)
 
+    def _update_entry_counter(
+        self,
+        person_detections,
+        frame_number: int,
+        frame: np.ndarray | None,
+        width: int | None,
+        height: int | None,
+    ) -> None:
+        if not self.entry_counter_enabled:
+            return
+
+        active_track_ids: set[int] = set()
+        timestamp = int(time.time())
+        for person_detection in person_detections:
+            track_id = self._get_track_id(person_detection)
+            if track_id is None:
+                continue
+            active_track_ids.add(track_id)
+            event = self.entry_detector.update(
+                track_id=track_id,
+                detection=person_detection,
+                frame_number=frame_number,
+                timestamp=timestamp,
+            )
+            if event is not None:
+                self._handle_entry_event(event, person_detection, frame, width, height)
+
+        self.entry_detector.cleanup(active_track_ids)
+
     def get_pipeline_string(self):
         source_kwargs = {}
         if self.frame_rate is not None:
@@ -1895,6 +2636,7 @@ class PersonFaceIdApp(GStreamerApp):
             return
 
         self._reload_enroll_zone_file()
+        self._reload_entry_lines_file()
 
         roi = hailo.get_roi_from_buffer(buffer)
         removed_detections = self._prune_non_person_detections(roi)
@@ -1918,12 +2660,18 @@ class PersonFaceIdApp(GStreamerApp):
         pad = element.get_static_pad("src")
         fmt, width, height = get_caps_from_pad(pad)
         frame_number = user_data.get_count()
-        needs_debug_frame = self.debug_face_overlay or self.debug_stream_enabled
+        needs_frame = (
+            self.debug_face_overlay
+            or self.debug_stream_enabled
+            or self.entry_counter_enabled
+        )
         frame = (
             get_numpy_from_buffer_efficient(buffer, fmt, width, height)
-            if needs_debug_frame
+            if needs_frame
             else None
         )
+        self._update_entry_counter(person_detections, frame_number, frame, width, height)
+        needs_debug_frame = self.debug_face_overlay or self.debug_stream_enabled
 
         stats = self.recognition_stats
         stats["frames"] += 1

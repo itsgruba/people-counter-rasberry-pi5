@@ -1,4 +1,10 @@
 # Normalized enrollment polygon: x1,y1,x2,y2,...
 # 0,0 is top-left; 1,1 is bottom-right.
-# Edit this line while the app is running when using --enroll-zone-file.
+# Edit these values while the app is running when using --enroll-zone-file.
 0.7,0.5,0.98,0.5,0.98,0.95,0.37,0.95
+
+# Entry lines are normalized horizontal Y coordinates.
+# The app counts entered when the same person_track_id crosses A and then B.
+entry_line_a_y=0.55
+entry_line_b_y=0.75
+entry_line_margin=0.02

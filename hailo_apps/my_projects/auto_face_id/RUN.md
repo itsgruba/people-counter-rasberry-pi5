@@ -31,7 +31,47 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --width 320 \
   --height 240 \
   --disable-sync \
-  --show-fps
+  --show-fps \
+  --notify-url http://127.0.0.1:8000/api/events \
+  --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --input http://192.168.8.14:8080/stream \
+  --width 640 \
+  --height 640 \
+  --disable-sync \
+  --show-fps \
+  --disable-local-display \
+  --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt \
+  --samples-per-person 3 \
+  --unknown-sample-interval 2 \
+  --min-unknown-age-seconds 0.5
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --input http://192.168.8.14:8080/stream \
+  --width 640 \
+  --height 640 \
+  --disable-sync \
+  --show-fps \
+  --disable-local-display \
+  --enroll-zone-file enroll_zone.txt \
+  --notify-url http://192.168.8.6:8000/api/events \
+  --samples-per-person 3 \
+  --unknown-sample-interval 2 \
+  --min-unknown-age-seconds 0.5
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --input http://192.168.8.14:8080/stream \
+  --width 640 \
+  --height 640 \
+  --disable-sync \
+  --show-fps \
+  --disable-local-display \
+  --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt \
+  --notify-url http://192.168.8.6:8000/api/events \
+  --samples-per-person 3 \
+  --unknown-sample-interval 2 \
+  --min-unknown-age-seconds 0.5
 ```
 
 ## Notes
@@ -50,8 +90,12 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   red foot markers are outside it.
 - For manual tuning without restarting the app, pass
   `--enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt`.
-  Edit and save that file; the debug stream will show the updated polygon and
-  vertex numbers.
+  Edit and save that file; the debug stream will show the updated polygon,
+  vertex numbers, and entry lines. The same file can contain:
+  `entry_line_a_y=0.55`, `entry_line_b_y=0.75`, and `entry_line_margin=0.02`.
+- The entry lines are visible in the MJPEG debug stream at
+  `http://<device-ip>:8090/debug`. A person is counted as `entered` after their
+  foot point crosses line A and then line B.
 - If people walk through the zone at normal speed, use faster enrollment:
   `--samples-per-person 3 --unknown-sample-interval 2 --min-unknown-age-seconds 0.5`.
 - The app stores its database and samples in:
@@ -65,6 +109,12 @@ hailo_apps/my_projects/auto_face_id/samples/
 
 ```bash
 uvicorn hailo_apps.my_projects.auto_face_id.person_face_api:app --host 127.0.0.1 --port 8000
+```
+
+- The global entry counter and recent entry journal are available at:
+
+```text
+http://127.0.0.1:8000/api/entries
 ```
 
 - The default resources for person detection, face detection, and face recognition are resolved automatically by the app.
