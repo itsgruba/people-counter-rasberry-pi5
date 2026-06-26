@@ -1055,6 +1055,55 @@ class SQLiteDatabaseHandler:
                 return self._row_to_record(row, distance=distance)
             return self._unknown_record()
 
+    def search_entered_record_best(
+        self,
+        embedding: np.ndarray,
+        metric_type: str = "cosine",
+    ) -> dict[str, Any]:
+        """Return the closest currently entered person without applying a threshold."""
+        if metric_type != "cosine":
+            raise ValueError("SQLiteDatabaseHandler currently supports only cosine distance.")
+
+        query = self._embedding_array(embedding)
+        with self._lock:
+            rows = self._connection.execute(
+                """
+                SELECT DISTINCT persons.*
+                FROM entered_person
+                JOIN persons ON persons.global_id = entered_person.global_id
+                ORDER BY persons.id
+                """
+            ).fetchall()
+            if not rows:
+                return self._unknown_record()
+
+            candidates: list[tuple[str, float]] = []
+            for row in rows:
+                avg_embedding = self._blob_embedding(row["avg_embedding"])
+                if np.linalg.norm(avg_embedding) > 0:
+                    candidates.append(
+                        (row["global_id"], self._cosine_distance(query, avg_embedding))
+                    )
+
+                sample_rows = self._sample_rows(row["id"])
+                candidates.extend(
+                    (row["global_id"], self._cosine_distance(query, sample_embedding))
+                    for sample_embedding in (
+                        self._blob_embedding(sample["embedding"]) for sample in sample_rows
+                    )
+                    if np.linalg.norm(sample_embedding) > 0
+                )
+
+            if not candidates:
+                return self._unknown_record()
+
+            global_id, distance = min(candidates, key=lambda item: item[1])
+            row = self._connection.execute(
+                "SELECT * FROM persons WHERE global_id = ?",
+                (global_id,),
+            ).fetchone()
+            return self._row_to_record(row, distance=distance) if row else self._unknown_record()
+
     def get_all_records(self, only_unknowns: bool = False) -> list[dict[str, Any]]:
         with self._lock:
             if only_unknowns:

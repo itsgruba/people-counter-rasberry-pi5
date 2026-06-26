@@ -72,6 +72,31 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --samples-per-person 3 \
   --unknown-sample-interval 2 \
   --min-unknown-age-seconds 0.5
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --camera-mode entry \
+  --input http://192.168.8.14:8080/stream \
+  --width 640 \
+  --height 640 \
+  --disable-sync \
+  --show-fps \
+  --disable-local-display \
+  --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt \
+  --notify-url http://192.168.8.6:8000/api/events \
+  --samples-per-person 3 \
+  --unknown-sample-interval 2 \
+  --min-unknown-age-seconds 0.5
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --camera-mode exit \
+  --input http://192.168.8.6:8080/stream \
+  --width 640 \
+  --height 640 \
+  --disable-sync \
+  --show-fps \
+  --disable-local-display \
+  --debug-stream-port 8091 \
+  --notify-url http://192.168.8.6:8000/api/events
 ```
 
 ## Notes

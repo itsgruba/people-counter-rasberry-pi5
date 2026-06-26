@@ -489,9 +489,8 @@ class PersonFaceIdApp(GStreamerApp):
         self.low_latency_queue_size = max(1, self.options_menu.low_latency_queue_size)
         self.pipeline_latency = max(0, self.options_menu.pipeline_latency_ms)
 
-        # Entry counting is intentionally tied to camera_mode. When EXIT mode is
-        # implemented, add a separate detector/handler rather than reusing entry
-        # DB methods with a different label.
+        # Entry counting is intentionally tied to camera_mode. EXIT mode uses
+        # face recognition only against the already-entered people list.
         self._validate_entry_options()
         self.entry_counter_enabled = (
             self.camera_mode == CameraMode.ENTRY
@@ -499,7 +498,7 @@ class PersonFaceIdApp(GStreamerApp):
         )
         if self.camera_mode == CameraMode.EXIT and not self.options_menu.disable_entry_counter:
             logger.warning(
-                "camera_mode=exit is reserved for the next camera; "
+                "camera_mode=exit runs entered-person recognition only; "
                 "entry counting is disabled for this instance."
             )
         self.entry_detector = EntryDetector(
@@ -698,7 +697,7 @@ class PersonFaceIdApp(GStreamerApp):
             default=CameraMode.ENTRY.value,
             help=(
                 "Role of this camera instance. 'entry' enables A -> B entry counting. "
-                "'exit' is reserved for the second camera and currently runs recognition only."
+                "'exit' recognizes only people already present in entered_person."
             ),
         )
         parser.add_argument(
@@ -2417,6 +2416,11 @@ class PersonFaceIdApp(GStreamerApp):
         confidence = 0.0 if person["label"] == "Unknown" else 1 - person["_distance"]
         return person, confidence
 
+    def _recognize_entered_embedding(self, embedding_vector: np.ndarray) -> tuple[dict, float]:
+        person = self.db_handler.search_entered_record_best(embedding=embedding_vector)
+        confidence = 0.0 if person["label"] == "Unknown" else 1 - person["_distance"]
+        return person, confidence
+
     def _record_pending_vote(
         self,
         track_id: int,
@@ -2567,6 +2571,31 @@ class PersonFaceIdApp(GStreamerApp):
                 confidence,
                 visit_count=updated_record["visit_count"],
             )
+
+    def _bind_entered_person_for_exit_camera(
+        self,
+        track_id: int,
+        person: dict,
+        confidence: float,
+        person_detection,
+    ) -> None:
+        """Bind an exit-camera track to the closest already-entered person."""
+        self.track_to_global_id[track_id] = person["global_id"]
+        self.track_to_label[track_id] = person["label"]
+        self._add_identity_classification(
+            person_detection,
+            person["label"],
+            confidence,
+            self.person_tracker_name,
+            track_id,
+        )
+        self._print_identity(
+            track_id,
+            person["global_id"],
+            person["label"],
+            confidence,
+            "recognized-entered",
+        )
 
     def _bind_existing_person_from_vote(
         self,
@@ -3133,18 +3162,19 @@ class PersonFaceIdApp(GStreamerApp):
                     1.0,
                     "recognized",
                 )
-                if frame is None:
+                if self.camera_mode == CameraMode.ENTRY and frame is None:
                     frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height)
-                self._save_known_person_sample_if_empty(
-                    known_global_id,
-                    known_label,
-                    matched_person_track_id,
-                    frame,
-                    detection,
-                    embedding_vector,
-                    width,
-                    height,
-                )
+                if self.camera_mode == CameraMode.ENTRY and frame is not None:
+                    self._save_known_person_sample_if_empty(
+                        known_global_id,
+                        known_label,
+                        matched_person_track_id,
+                        frame,
+                        detection,
+                        embedding_vector,
+                        width,
+                        height,
+                    )
                 continue
 
             bbox = detection.get_bbox()
@@ -3158,6 +3188,25 @@ class PersonFaceIdApp(GStreamerApp):
                 bbox.xmax(),
                 bbox.ymax(),
             )
+
+            if self.camera_mode == CameraMode.EXIT:
+                person, confidence = self._recognize_entered_embedding(embedding_vector)
+                if person["label"] == "Unknown":
+                    stats["unknown"] += 1
+                    logger.debug(
+                        "Exit camera has no entered-person candidates for track_id=%d",
+                        matched_person_track_id,
+                    )
+                    continue
+
+                self._bind_entered_person_for_exit_camera(
+                    matched_person_track_id,
+                    person,
+                    confidence,
+                    matched_person,
+                )
+                stats["known"] += 1
+                continue
 
             person, confidence = self._recognize_embedding(embedding_vector)
             stable_vote = self._record_pending_vote(
