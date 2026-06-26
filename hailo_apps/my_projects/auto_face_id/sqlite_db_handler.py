@@ -43,6 +43,7 @@ class SQLiteDatabaseHandler:
         self._create_schema()
         self._ensure_person_columns()
         self._ensure_entry_event_columns()
+        self._backfill_entered_person()
         self._embedding_cache: dict[str, np.ndarray] = {}
         self._sample_embedding_cache: list[tuple[str, np.ndarray]] = []
         self._reload_embedding_cache()
@@ -116,6 +117,25 @@ class SQLiteDatabaseHandler:
 
                 CREATE INDEX IF NOT EXISTS idx_entry_events_detected_at
                 ON entry_events(detected_at);
+
+                CREATE TABLE IF NOT EXISTS entered_person (
+                    id TEXT PRIMARY KEY,
+                    entry_event_id TEXT UNIQUE NOT NULL,
+                    global_id TEXT NOT NULL,
+                    label TEXT NOT NULL,
+                    entered_at INTEGER NOT NULL,
+                    track_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    updated_at INTEGER NOT NULL,
+                    FOREIGN KEY (entry_event_id) REFERENCES entry_events(id) ON DELETE CASCADE,
+                    FOREIGN KEY (global_id) REFERENCES persons(global_id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_entered_person_global_id
+                ON entered_person(global_id);
+
+                CREATE INDEX IF NOT EXISTS idx_entered_person_entered_at
+                ON entered_person(entered_at);
                 """
             )
 
@@ -159,6 +179,40 @@ class SQLiteDatabaseHandler:
             for column_name, statement in migrations:
                 if column_name not in columns:
                     self._connection.execute(statement)
+
+    def _backfill_entered_person(self) -> None:
+        """Create explicit entered-person links for older confirmed entry events."""
+        now = int(time.time())
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO entered_person (
+                    id,
+                    entry_event_id,
+                    global_id,
+                    label,
+                    entered_at,
+                    track_id,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    lower(hex(randomblob(16))),
+                    entry_events.id,
+                    entry_events.global_id,
+                    entry_events.label,
+                    COALESCE(entry_events.confirmed_at, entry_events.detected_at),
+                    entry_events.track_id,
+                    ?,
+                    ?
+                FROM entry_events
+                JOIN persons ON persons.global_id = entry_events.global_id
+                WHERE entry_events.status = 'confirmed'
+                    AND entry_events.global_id IS NOT NULL
+                ON CONFLICT(entry_event_id) DO NOTHING
+                """,
+                (now, now),
+            )
 
     @staticmethod
     def _embedding_array(embedding: np.ndarray | list[float]) -> np.ndarray:
@@ -344,6 +398,59 @@ class SQLiteDatabaseHandler:
             )
             self._embedding_cache[global_id] = vector.copy()
             self._sample_embedding_cache.append((global_id, vector.copy()))
+
+        return self.get_record_by_id(global_id)
+
+    def create_placeholder_record(
+        self,
+        timestamp: int,
+        label: str,
+        global_id: str | None = None,
+        threshold: float | None = None,
+        visits_count: int = 1,
+        entered: int = 0,
+        last_seen_track_id: int | None = None,
+    ) -> dict[str, Any]:
+        """Create a person row for an entered track before a usable face sample exists."""
+        vector = np.zeros(EMBEDDING_DIMENSION, dtype=np.float32)
+        global_id = global_id or str(uuid.uuid4())
+        threshold = (
+            self.classificaiton_confidence_threshold if threshold is None else threshold
+        )
+
+        with self._lock, self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO persons (
+                    global_id,
+                    label,
+                    avg_embedding,
+                    last_sample_received_time,
+                    classification_confidence_threshold,
+                    value,
+                    visits_count,
+                    entered,
+                    created_at,
+                    last_seen_at,
+                    last_seen_track_id
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    global_id,
+                    label,
+                    vector.tobytes(),
+                    timestamp,
+                    threshold,
+                    visits_count,
+                    visits_count,
+                    entered,
+                    timestamp,
+                    timestamp,
+                    last_seen_track_id,
+                ),
+            )
+            self._embedding_cache[global_id] = vector.copy()
 
         return self.get_record_by_id(global_id)
 
@@ -580,6 +687,41 @@ class SQLiteDatabaseHandler:
                     ),
                 )
 
+            self._connection.execute(
+                """
+                INSERT INTO entered_person (
+                    id,
+                    entry_event_id,
+                    global_id,
+                    label,
+                    entered_at,
+                    track_id,
+                    created_at,
+                    updated_at
+                )
+                SELECT
+                    lower(hex(randomblob(16))),
+                    id,
+                    global_id,
+                    label,
+                    COALESCE(confirmed_at, detected_at),
+                    track_id,
+                    ?,
+                    ?
+                FROM entry_events
+                WHERE id = ?
+                    AND status = 'confirmed'
+                    AND global_id IS NOT NULL
+                ON CONFLICT(entry_event_id) DO UPDATE SET
+                    global_id = excluded.global_id,
+                    label = excluded.label,
+                    entered_at = excluded.entered_at,
+                    track_id = COALESCE(excluded.track_id, entered_person.track_id),
+                    updated_at = excluded.updated_at
+                """,
+                (now, now, entry_event_id),
+            )
+
             if not already_confirmed:
                 self._connection.execute(
                     """
@@ -612,7 +754,7 @@ class SQLiteDatabaseHandler:
     def get_total_entered(self) -> int:
         with self._lock:
             row = self._connection.execute(
-                "SELECT COUNT(*) AS total FROM entry_events WHERE status = 'confirmed'"
+                "SELECT COUNT(*) AS total FROM entered_person"
             ).fetchone()
             return int(row["total"] if row is not None else 0)
 
@@ -650,6 +792,95 @@ class SQLiteDatabaseHandler:
                 (entry_event_id,),
             ).fetchone()
             return self._entry_event_record(row)
+
+    def get_entered_people(self, limit: int | None = 100) -> list[dict[str, Any]]:
+        """Return explicit entered_person rows with their person and entry event."""
+        with self._lock:
+            if limit is None:
+                rows = self._connection.execute(
+                    """
+                    SELECT
+                        entered_person.entry_event_id,
+                        entered_person.entered_at,
+                        entered_person.track_id AS entered_track_id,
+                        persons.id AS person_row_id,
+                        persons.*,
+                        entry_events.id AS event_id,
+                        entry_events.status AS event_status,
+                        entry_events.detected_at AS event_detected_at,
+                        entry_events.confirmed_at AS event_confirmed_at,
+                        entry_events.track_id AS event_track_id,
+                        entry_events.global_id AS event_global_id,
+                        entry_events.label AS event_label,
+                        entry_events.entry_photo_path AS event_entry_photo_path,
+                        entry_events.confirmed_photo_path AS event_confirmed_photo_path,
+                        entry_events.frame_number AS event_frame_number,
+                        entry_events.point_x AS event_point_x,
+                        entry_events.point_y AS event_point_y
+                    FROM entered_person
+                    JOIN persons ON persons.global_id = entered_person.global_id
+                    JOIN entry_events ON entry_events.id = entered_person.entry_event_id
+                    ORDER BY entered_person.entered_at DESC, entered_person.created_at DESC
+                    """
+                ).fetchall()
+            else:
+                limit = max(1, min(limit, 1000))
+                rows = self._connection.execute(
+                    """
+                    SELECT
+                        entered_person.entry_event_id,
+                        entered_person.entered_at,
+                        entered_person.track_id AS entered_track_id,
+                        persons.id AS person_row_id,
+                        persons.*,
+                        entry_events.id AS event_id,
+                        entry_events.status AS event_status,
+                        entry_events.detected_at AS event_detected_at,
+                        entry_events.confirmed_at AS event_confirmed_at,
+                        entry_events.track_id AS event_track_id,
+                        entry_events.global_id AS event_global_id,
+                        entry_events.label AS event_label,
+                        entry_events.entry_photo_path AS event_entry_photo_path,
+                        entry_events.confirmed_photo_path AS event_confirmed_photo_path,
+                        entry_events.frame_number AS event_frame_number,
+                        entry_events.point_x AS event_point_x,
+                        entry_events.point_y AS event_point_y
+                    FROM entered_person
+                    JOIN persons ON persons.global_id = entered_person.global_id
+                    JOIN entry_events ON entry_events.id = entered_person.entry_event_id
+                    ORDER BY entered_person.entered_at DESC, entered_person.created_at DESC
+                    LIMIT ?
+                    """,
+                    (limit,),
+                ).fetchall()
+
+            entered_people = []
+            for row in rows:
+                person = self._row_to_record(row)
+                event = {
+                    "id": row["event_id"],
+                    "status": row["event_status"],
+                    "detected_at": row["event_detected_at"],
+                    "confirmed_at": row["event_confirmed_at"],
+                    "track_id": row["event_track_id"],
+                    "global_id": row["event_global_id"],
+                    "label": row["event_label"],
+                    "entry_photo_path": row["event_entry_photo_path"],
+                    "confirmed_photo_path": row["event_confirmed_photo_path"],
+                    "frame_number": row["event_frame_number"],
+                    "point_x": row["event_point_x"],
+                    "point_y": row["event_point_y"],
+                }
+                entered_people.append(
+                    {
+                        "entry_event_id": row["entry_event_id"],
+                        "entered_at": row["entered_at"],
+                        "track_id": row["entered_track_id"],
+                        "person": person,
+                        "entry_event": event,
+                    }
+                )
+            return entered_people
 
     def add_visit_record(
         self,
@@ -901,6 +1132,7 @@ class SQLiteDatabaseHandler:
 
     def clear_table(self) -> None:
         with self._lock, self._connection:
+            self._connection.execute("DELETE FROM entered_person")
             self._connection.execute("DELETE FROM entry_events")
             self._connection.execute("DELETE FROM persons")
             self._connection.execute("DELETE FROM sqlite_sequence WHERE name = 'persons'")

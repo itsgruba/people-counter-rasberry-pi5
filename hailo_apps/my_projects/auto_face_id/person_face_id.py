@@ -1,5 +1,19 @@
 #!/usr/bin/env python3
-"""Person tracking with face detection/recognition merged from parallel Hailo branches."""
+"""
+Person + face identification application.
+
+High-level flow:
+1. GStreamer/Hailo detects and tracks faces.
+2. Face embeddings are cached by face track ID.
+3. GStreamer/Hailo detects and tracks persons.
+4. Every face is matched back to the containing person box.
+5. The person track is recognized, enrolled as a new person, or left pending.
+6. In entry camera mode, a person track is counted after crossing line A and then line B.
+
+The file is intentionally split into sections below. When adding a second camera,
+keep camera-specific behavior behind CameraMode first, then move shared recognition
+logic into smaller modules only when it becomes painful to keep here.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +26,7 @@ import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 
 import gi
@@ -89,6 +104,28 @@ QUEUE_PATTERN = re.compile(
 )
 
 
+# ---------------------------------------------------------------------------
+# Camera roles
+# ---------------------------------------------------------------------------
+
+
+class CameraMode(str, Enum):
+    """Role of the current camera instance.
+
+    Today only ENTRY has counting logic. EXIT is defined now so the next camera
+    can be wired in through one explicit switch instead of scattering
+    "is this entry or exit?" checks through the recognition code.
+    """
+
+    ENTRY = "entry"
+    EXIT = "exit"
+
+
+# ---------------------------------------------------------------------------
+# Small state containers
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class PendingSample:
     """One candidate sample for a newly observed unknown face."""
@@ -146,6 +183,20 @@ class EntryTrackState:
     last_seen_at: float = field(default_factory=time.time)
     last_frame: int = 0
     last_point: tuple[float, float] | None = None
+
+
+@dataclass
+class PendingEntryContext:
+    """Runtime context for an A -> B entry waiting for identity resolution."""
+
+    event: EntryEvent
+    entry_photo_path: str | None
+    created_at: float = field(default_factory=time.time)
+
+
+# ---------------------------------------------------------------------------
+# Entry line crossing
+# ---------------------------------------------------------------------------
 
 
 class EntryDetector:
@@ -214,12 +265,18 @@ class EntryDetector:
         frame_number: int,
         timestamp: int,
     ) -> EntryEvent | None:
+        # The bottom-center of the person box is used as the crossing point.
+        # This is more stable for doorway logic than the bbox center because it
+        # follows the person's feet/ground position.
         point = self.anchor_point(detection)
         state = self.tracks.setdefault(track_id, EntryTrackState())
         previous_point = state.last_point
         state.last_seen_at = time.time()
         state.last_frame = frame_number
 
+        # Each line has a small dead zone (margin). The side only changes when
+        # the anchor point moves clearly past the line, which prevents jitter
+        # around the line from creating duplicate events.
         new_side_a, crossed_a = self._update_side(state.last_side_a, point[1], self.line_a_y)
         new_side_b, crossed_b = self._update_side(state.last_side_b, point[1], self.line_b_y)
         state.last_side_a = new_side_a
@@ -238,6 +295,9 @@ class EntryDetector:
             state.crossed_a_frame = frame_number
             state.crossed_a_at = timestamp
 
+        # A valid entry is only A -> B. If both lines are crossed in one frame,
+        # _line_cross_order uses the previous and current anchor positions to
+        # keep the order deterministic.
         enough_frames = (
             state.crossed_a_frame is not None
             and frame_number - state.crossed_a_frame >= self.min_frames_between_lines
@@ -307,8 +367,13 @@ class EntryDetector:
             self.tracks.pop(track_id, None)
 
 
+# ---------------------------------------------------------------------------
+# Data shared between GStreamer callbacks and optional debug HTTP stream
+# ---------------------------------------------------------------------------
+
+
 class PersonFaceIdData(app_callback_class):
-    """Shared state for the GStreamer callback."""
+    """Small thread-safe state object passed into the GStreamer callback."""
 
     def __init__(self) -> None:
         super().__init__()
@@ -354,19 +419,31 @@ class PersonFaceIdData(app_callback_class):
             return self.latest_debug_jpeg, self.latest_debug_frame_number
 
 
+# ---------------------------------------------------------------------------
+# Main application
+# ---------------------------------------------------------------------------
+
+
 class PersonFaceIdApp(GStreamerApp):
-    """Detect persons, then use faces inside person ROIs for recognition."""
+    """Build the Hailo pipeline and own all recognition/enrollment state."""
 
     def __init__(self, user_data, parser: argparse.ArgumentParser | None = None):
         parser = parser or self._build_parser()
         super().__init__(parser, user_data)
 
+        # Logging must be initialized after GStreamerApp parses CLI options.
         if hasattr(self.options_menu, "log_level") or hasattr(self.options_menu, "debug"):
             init_logging(
                 level=level_from_args(self.options_menu),
                 log_file=getattr(self.options_menu, "log_file", None),
             )
 
+        # Camera role. Keep mode decisions here or in small helper methods so a
+        # future exit camera does not fork the whole pipeline callback.
+        self.camera_mode = CameraMode(self.options_menu.camera_mode)
+
+        # Enrollment and recognition tuning. These values decide when an
+        # unknown face becomes a stable existing match or a brand-new person.
         self.samples_per_person = self.options_menu.samples_per_person
         self.unknown_sample_interval = self.options_menu.unknown_sample_interval
         self.min_enroll_confidence = self.options_menu.min_enroll_confidence
@@ -378,6 +455,9 @@ class PersonFaceIdApp(GStreamerApp):
             self.recognition_vote_threshold,
             self.recognition_vote_window,
         )
+
+        # Live-configured enrollment zone. Recognition still runs everywhere;
+        # this zone only limits where new people are automatically enrolled.
         self.enroll_zone = self._parse_enroll_zone(self.options_menu.enroll_zone)
         self.enroll_zone_file = (
             self._resolve_live_config_path(self.options_menu.enroll_zone_file)
@@ -394,6 +474,8 @@ class PersonFaceIdApp(GStreamerApp):
         self.max_enroll_nose_offset = self.options_menu.max_enroll_nose_offset
         self.min_enroll_eye_balance = self.options_menu.min_enroll_eye_balance
         self.require_enroll_landmarks = self.options_menu.require_enroll_landmarks
+
+        # External output and debug controls.
         self.print_every_frame = self.options_menu.print_every_frame
         self.notify_url = self.options_menu.notify_url
         self.person_class_id = self.options_menu.person_class_id
@@ -406,14 +488,30 @@ class PersonFaceIdApp(GStreamerApp):
         self.low_latency_enabled = not self.options_menu.disable_low_latency
         self.low_latency_queue_size = max(1, self.options_menu.low_latency_queue_size)
         self.pipeline_latency = max(0, self.options_menu.pipeline_latency_ms)
+
+        # Entry counting is intentionally tied to camera_mode. When EXIT mode is
+        # implemented, add a separate detector/handler rather than reusing entry
+        # DB methods with a different label.
         self._validate_entry_options()
-        self.entry_counter_enabled = not self.options_menu.disable_entry_counter
+        self.entry_counter_enabled = (
+            self.camera_mode == CameraMode.ENTRY
+            and not self.options_menu.disable_entry_counter
+        )
+        if self.camera_mode == CameraMode.EXIT and not self.options_menu.disable_entry_counter:
+            logger.warning(
+                "camera_mode=exit is reserved for the next camera; "
+                "entry counting is disabled for this instance."
+            )
         self.entry_detector = EntryDetector(
             line_a_y=self.options_menu.entry_line_a_y,
             line_b_y=self.options_menu.entry_line_b_y,
             margin=self.options_menu.entry_line_margin,
             track_ttl_seconds=self.options_menu.entry_track_ttl_seconds,
             min_frames_between_lines=self.options_menu.entry_min_frames_between_lines,
+        )
+        self.entry_pending_resolution_seconds = max(
+            0.0,
+            self.options_menu.entry_pending_resolution_seconds,
         )
         self.entry_lines_file = (
             self._resolve_live_config_path(self.options_menu.entry_lines_file)
@@ -428,15 +526,22 @@ class PersonFaceIdApp(GStreamerApp):
         self._debug_fps_frames = 0
         self._debug_fps_updated_at = time.time()
         self._debug_server_thread: threading.Thread | None = None
+
+        # Hailo tracker names. These must match the names used in
+        # get_pipeline_string(), because classifications are attached back to
+        # tracker metadata by name and track_id.
         self.face_tracker_name = "hailo_face_tracker"
         self.person_tracker_name = "person_tracker"
         self.tracker = HailoTracker.get_instance()
 
+        # Persistent storage layout for the SQLite database and saved images.
         DATABASE_DIR.mkdir(parents=True, exist_ok=True)
         SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
         self.database_dir = DATABASE_DIR
         self.samples_dir = SAMPLES_DIR
 
+        # Resolve model files and native post-processing libraries once during
+        # startup; the pipeline builder only consumes the resolved paths.
         self.person_hef_path = resolve_hef_path(
             self.options_menu.person_hef_path,
             app_name=DETECTION_PIPELINE,
@@ -510,12 +615,15 @@ class PersonFaceIdApp(GStreamerApp):
         self.person_cropper_function_name = CLIP_CROPPER_OBJECT_POSTPROCESS_FUNCTION_NAME
         self.face_cropper_function_name = "face_recognition"
 
+        # Detection thresholds are passed as a single string because the shared
+        # Hailo helper pipeline expects additional hailofilter params in that form.
         self.person_thresholds_str = (
             "nms-score-threshold=0.3 "
             "nms-iou-threshold=0.45 "
             "output-format-type=HAILO_FORMAT_TYPE_FLOAT32"
         )
 
+        # Database handler owns persistent people, samples, visits, and entry events.
         self.db_handler = SQLiteDatabaseHandler(
             db_name=DB_NAME,
             threshold=0.55,
@@ -523,6 +631,8 @@ class PersonFaceIdApp(GStreamerApp):
             samples_dir=str(self.samples_dir),
         )
 
+        # Runtime identity maps are keyed by Hailo person track_id. Track IDs are
+        # short-lived camera-session IDs; global_id is the persistent DB identity.
         self.pending_unknowns: dict[int, PendingIdentity] = {}
         self.face_track_embeddings: dict[int, np.ndarray] = {}
         self.track_to_global_id: dict[int, str] = {}
@@ -531,13 +641,16 @@ class PersonFaceIdApp(GStreamerApp):
         self.recognition_stats = self._new_recognition_stats()
         self.entered_people: list[dict] = []
         self.entered_people_by_entry_event_id: dict[str, dict] = {}
+        self.pending_entry_contexts: dict[int, PendingEntryContext] = {}
         self._load_entered_people()
         self.next_person_index = self._load_next_person_index()
 
+        # GStreamerApp calls this for the identity_callback element.
         self.app_callback = self.pipeline_callback
 
         logger.info("Person-face database: %s", self.database_dir / DB_NAME)
         logger.info("Person-face samples: %s", self.samples_dir)
+        logger.info("Camera mode: %s", self.camera_mode.value)
         logger.info("Person-face database records: %d", len(self.db_handler.get_all_records()))
         logger.info("Loaded entered_people records: %d", len(self.entered_people))
         if self.entry_counter_enabled:
@@ -557,6 +670,10 @@ class PersonFaceIdApp(GStreamerApp):
         self.create_pipeline()
         self._connect_face_embedding_callback()
 
+    # ------------------------------------------------------------------
+    # CLI and live configuration
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _build_parser() -> argparse.ArgumentParser:
         parser = get_pipeline_parser()
@@ -573,6 +690,15 @@ class PersonFaceIdApp(GStreamerApp):
             help=(
                 "Path or model name for the face detection and face recognition HEFs. "
                 "Provide two values if overriding the defaults."
+            ),
+        )
+        parser.add_argument(
+            "--camera-mode",
+            choices=tuple(mode.value for mode in CameraMode),
+            default=CameraMode.ENTRY.value,
+            help=(
+                "Role of this camera instance. 'entry' enables A -> B entry counting. "
+                "'exit' is reserved for the second camera and currently runs recognition only."
             ),
         )
         parser.add_argument(
@@ -748,6 +874,15 @@ class PersonFaceIdApp(GStreamerApp):
             help="Minimum frame gap between crossing line A and line B. Default: 0.",
         )
         parser.add_argument(
+            "--entry-pending-resolution-seconds",
+            type=float,
+            default=2.0,
+            help=(
+                "Seconds to wait for recognition after A -> B before creating a new "
+                "fallback person. Use 0 to create immediately. Default: 2."
+            ),
+        )
+        parser.add_argument(
             "--entry-lines-file",
             default=None,
             help=(
@@ -842,6 +977,8 @@ class PersonFaceIdApp(GStreamerApp):
             raise ValueError("--entry-track-ttl-seconds must be >= 0.")
         if self.options_menu.entry_min_frames_between_lines < 0:
             raise ValueError("--entry-min-frames-between-lines must be >= 0.")
+        if self.options_menu.entry_pending_resolution_seconds < 0:
+            raise ValueError("--entry-pending-resolution-seconds must be >= 0.")
 
     @staticmethod
     def _validate_entry_values(line_a_y: float, line_b_y: float, margin: float) -> None:
@@ -1007,6 +1144,10 @@ class PersonFaceIdApp(GStreamerApp):
                 exc,
             )
 
+    # ------------------------------------------------------------------
+    # MJPEG debug stream
+    # ------------------------------------------------------------------
+
     def _start_debug_stream_server(self) -> None:
         try:
             from flask import Flask, Response, jsonify, stream_with_context
@@ -1081,6 +1222,10 @@ class PersonFaceIdApp(GStreamerApp):
                 + jpeg
                 + b"\r\n"
             )
+
+    # ------------------------------------------------------------------
+    # Persistent identity and entry-event state
+    # ------------------------------------------------------------------
 
     def _load_next_person_index(self) -> int:
         max_index = 0
@@ -1278,16 +1423,11 @@ class PersonFaceIdApp(GStreamerApp):
         """Restore confirmed entries as entered_people links from SQLite."""
         self.entered_people.clear()
         self.entered_people_by_entry_event_id.clear()
-        for entry_event in self.db_handler.get_entry_events(limit=None):
-            if entry_event.get("status") != "confirmed":
-                continue
-            global_id = entry_event.get("global_id")
-            if not global_id:
-                continue
-            person = self.db_handler.get_record_by_id(global_id)
-            if person is None:
-                continue
-            self._remember_entered_person(person, entry_event)
+        for entered_person in self.db_handler.get_entered_people(limit=None):
+            self._remember_entered_person(
+                entered_person["person"],
+                entered_person["entry_event"],
+            )
 
     def _record_visit_snapshot(
         self,
@@ -1366,6 +1506,224 @@ class PersonFaceIdApp(GStreamerApp):
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             logger.debug("Failed to notify %s: %s", self.notify_url, exc)
 
+    def _create_person_from_pending_samples(
+        self,
+        track_id: int,
+        pending: PendingIdentity,
+        label: str,
+        timestamp: int,
+    ) -> dict:
+        """Create a new searchable person from whatever face samples are available."""
+        avg_embedding = np.mean([sample.embedding for sample in pending.samples], axis=0)
+        for sample in pending.samples:
+            self._move_sample_to_person_dir(sample, label)
+
+        best_sample = max(pending.samples, key=lambda sample: sample.confidence)
+        new_person = self.db_handler.create_record(
+            embedding=avg_embedding,
+            sample=best_sample.image_path,
+            timestamp=timestamp,
+            label=label,
+            last_seen_track_id=track_id,
+        )
+
+        for sample in pending.samples:
+            if sample.image_path == best_sample.image_path:
+                continue
+            current_record = self.db_handler.get_record_by_id(new_person["global_id"])
+            if current_record is None:
+                continue
+            self.db_handler.insert_new_sample(
+                record=current_record,
+                embedding=sample.embedding,
+                sample=sample.image_path,
+                timestamp=sample.timestamp,
+            )
+        return self.db_handler.get_record_by_id(new_person["global_id"]) or new_person
+
+    def _create_placeholder_person(
+        self,
+        track_id: int,
+        label: str,
+        timestamp: int,
+        entry_photo_path: str | None,
+    ) -> dict:
+        """Create a non-searchable person row for an entry without a face embedding yet."""
+        new_person = self.db_handler.create_placeholder_record(
+            timestamp=timestamp,
+            label=label,
+            last_seen_track_id=track_id,
+        )
+        if entry_photo_path:
+            self.db_handler.add_visit_record(
+                global_id=new_person["global_id"],
+                visit_number=int(new_person["visit_count"]),
+                timestamp=timestamp,
+                photo_path=entry_photo_path,
+                track_id=track_id,
+            )
+            refreshed_person = self.db_handler.get_record_by_id(new_person["global_id"])
+            if refreshed_person is not None:
+                new_person = refreshed_person
+        return new_person
+
+    def _save_known_person_sample_if_empty(
+        self,
+        global_id: str,
+        label: str,
+        track_id: int,
+        frame: np.ndarray,
+        face_detection,
+        embedding_vector: np.ndarray,
+        width: int,
+        height: int,
+    ) -> None:
+        """Fill a placeholder person with its first usable face sample."""
+        person = self.db_handler.get_record_by_id(global_id)
+        if person is None or person.get("samples_json"):
+            return
+        if not self._is_good_enrollment_sample(frame, face_detection, width, height):
+            return
+
+        sample_dir = self._person_sample_dir(label)
+        sample_dir.mkdir(parents=True, exist_ok=True)
+        image_path = sample_dir / f"{uuid.uuid4()}.jpeg"
+        cropped = self.crop_frame(frame, face_detection.get_bbox(), width, height)
+        if cropped.size == 0:
+            return
+        self.save_image_file(cropped, str(image_path))
+        self.db_handler.insert_new_sample(
+            record=person,
+            embedding=embedding_vector,
+            sample=str(image_path),
+            timestamp=int(time.time()),
+        )
+        logger.info(
+            "Added first face sample for placeholder person label=%s track_id=%d",
+            label,
+            track_id,
+        )
+
+    def _resolve_pending_entry_as_new_person(
+        self,
+        context: PendingEntryContext,
+        reason: str,
+        person_detection=None,
+        frame: np.ndarray | None = None,
+        width: int | None = None,
+        height: int | None = None,
+    ) -> None:
+        """Guarantee that a completed A -> B event lands in entered_person."""
+        event = context.event
+        if not self.entry_detector.has_uncounted_entry(event.track_id):
+            self.pending_entry_contexts.pop(event.track_id, None)
+            return
+
+        label = self._make_person_label()
+        timestamp = int(time.time())
+        pending = self.pending_unknowns.get(event.track_id)
+        created_from_samples = pending is not None and bool(pending.samples)
+        if created_from_samples:
+            new_person = self._create_person_from_pending_samples(
+                event.track_id,
+                pending,
+                label,
+                timestamp,
+            )
+            self.pending_unknowns.pop(event.track_id, None)
+        else:
+            new_person = self._create_placeholder_person(
+                event.track_id,
+                label,
+                timestamp,
+                context.entry_photo_path,
+            )
+
+        if created_from_samples and context.entry_photo_path:
+            self.db_handler.add_visit_record(
+                global_id=new_person["global_id"],
+                visit_number=int(new_person["visit_count"]),
+                timestamp=timestamp,
+                photo_path=context.entry_photo_path,
+                track_id=event.track_id,
+            )
+            refreshed_person = self.db_handler.get_record_by_id(new_person["global_id"])
+            if refreshed_person is not None:
+                new_person = refreshed_person
+
+        self.track_to_global_id[event.track_id] = new_person["global_id"]
+        self.track_to_label[event.track_id] = label
+        if person_detection is not None:
+            self._add_identity_classification(
+                person_detection,
+                label,
+                1.0,
+                self.person_tracker_name,
+                event.track_id,
+            )
+
+        print(
+            f"entry-created-person: entry_event_id={event.entry_event_id} "
+            f"track_id={event.track_id} global_id={new_person['global_id']} "
+            f"label={label} reason={reason}"
+        )
+        self._mark_known_person_entered(
+            global_id=new_person["global_id"],
+            label=label,
+            track_id=event.track_id,
+            confidence=1.0,
+            entry_event=event,
+            person_detection=person_detection,
+            frame=frame,
+            width=width,
+            height=height,
+        )
+
+    def _resolve_stale_pending_entries(
+        self,
+        active_person_detections: dict[int, object],
+        frame: np.ndarray | None,
+        width: int | None,
+        height: int | None,
+    ) -> None:
+        if not self.pending_entry_contexts:
+            return
+
+        now = time.time()
+        for track_id, context in list(self.pending_entry_contexts.items()):
+            if not self.entry_detector.has_uncounted_entry(track_id):
+                self.pending_entry_contexts.pop(track_id, None)
+                continue
+
+            global_id = self.track_to_global_id.get(track_id)
+            if global_id is not None:
+                label = self.track_to_label.get(track_id, global_id)
+                self._mark_known_person_entered(
+                    global_id=global_id,
+                    label=label,
+                    track_id=track_id,
+                    confidence=1.0,
+                    entry_event=context.event,
+                    person_detection=active_person_detections.get(track_id),
+                    frame=frame,
+                    width=width,
+                    height=height,
+                )
+                continue
+
+            age = now - context.created_at
+            if age < self.entry_pending_resolution_seconds:
+                continue
+
+            self._resolve_pending_entry_as_new_person(
+                context,
+                reason="entry-pending-timeout",
+                person_detection=active_person_detections.get(track_id),
+                frame=frame,
+                width=width,
+                height=height,
+            )
+
     def _handle_entry_event(
         self,
         event: EntryEvent,
@@ -1395,6 +1753,10 @@ class PersonFaceIdApp(GStreamerApp):
         label = self.track_to_label.get(event.track_id, "Unknown")
         global_id = self.track_to_global_id.get(event.track_id)
         if global_id is None:
+            self.pending_entry_contexts[event.track_id] = PendingEntryContext(
+                event=event,
+                entry_photo_path=entry_photo_path,
+            )
             print(
                 f"entered-pending: entry_event_id={event.entry_event_id} "
                 f"track_id={event.track_id} label=Unknown"
@@ -1408,6 +1770,15 @@ class PersonFaceIdApp(GStreamerApp):
                 entry_event_id=event.entry_event_id,
                 total_entered=pending_event.get("total_entered"),
             )
+            if self.entry_pending_resolution_seconds == 0:
+                self._resolve_pending_entry_as_new_person(
+                    self.pending_entry_contexts[event.track_id],
+                    reason="entry-pending-immediate",
+                    person_detection=person_detection,
+                    frame=frame,
+                    width=width,
+                    height=height,
+                )
             return
 
         self._mark_known_person_entered(
@@ -1459,6 +1830,7 @@ class PersonFaceIdApp(GStreamerApp):
             return
 
         self.entry_detector.mark_entry_counted(track_id, global_id)
+        self.pending_entry_contexts.pop(track_id, None)
         self._remember_entered_person(record)
         entered = int(record.get("entered", 0))
         total_entered = int(record.get("total_entered", 0))
@@ -1504,6 +1876,10 @@ class PersonFaceIdApp(GStreamerApp):
             height=height,
         )
 
+    # ------------------------------------------------------------------
+    # Pipeline hooks
+    # ------------------------------------------------------------------
+
     def shutdown(self, signum=None, frame=None):
         """Prevent double shutdown and noisy HailoRT transfer errors on Ctrl-C."""
         if self._shutdown_started:
@@ -1529,6 +1905,9 @@ class PersonFaceIdApp(GStreamerApp):
         if buffer is None:
             return Gst.PadProbeReturn.OK
 
+        # Face recognition embeddings are produced in the face branch before the
+        # person branch finishes. Cache them by face track_id so the main
+        # identity callback can match each face back to the containing person.
         roi = hailo.get_roi_from_buffer(buffer)
         for detection in (
             detection
@@ -1550,6 +1929,10 @@ class PersonFaceIdApp(GStreamerApp):
                 detection.remove_object(embedding)
 
         return Gst.PadProbeReturn.OK
+
+    # ------------------------------------------------------------------
+    # Debug drawing
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _draw_detection(
@@ -1787,6 +2170,10 @@ class PersonFaceIdApp(GStreamerApp):
             cv2.LINE_AA,
         )
 
+    # ------------------------------------------------------------------
+    # Geometry helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _bbox_to_pixels(detection, width: int, height: int) -> tuple[int, int, int, int]:
         bbox = detection.get_bbox()
@@ -1893,6 +2280,10 @@ class PersonFaceIdApp(GStreamerApp):
                 roi.remove_object(detection)
                 removed += 1
         return removed
+
+    # ------------------------------------------------------------------
+    # Image and sample storage
+    # ------------------------------------------------------------------
 
     def save_image_file(self, frame, image_path):
         image = Image.fromarray(frame)
@@ -2016,6 +2407,10 @@ class PersonFaceIdApp(GStreamerApp):
             cropped = frame
         self.save_image_file(cropped, str(image_path))
         return str(image_path)
+
+    # ------------------------------------------------------------------
+    # Recognition, voting, and automatic enrollment
+    # ------------------------------------------------------------------
 
     def _recognize_embedding(self, embedding_vector: np.ndarray) -> tuple[dict, float]:
         person = self.db_handler.search_record_deep(embedding=embedding_vector)
@@ -2366,27 +2761,12 @@ class PersonFaceIdApp(GStreamerApp):
             return
 
         label = self._make_person_label()
-        for sample in pending.samples:
-            self._move_sample_to_person_dir(sample, label)
-
-        best_sample = max(pending.samples, key=lambda sample: sample.confidence)
-        new_person = self.db_handler.create_record(
-            embedding=avg_embedding,
-            sample=best_sample.image_path,
-            timestamp=int(time.time()),
+        new_person = self._create_person_from_pending_samples(
+            track_id=track_id,
+            pending=pending,
             label=label,
-            last_seen_track_id=track_id,
+            timestamp=int(time.time()),
         )
-
-        for sample in pending.samples:
-            if sample.image_path == best_sample.image_path:
-                continue
-            self.db_handler.insert_new_sample(
-                record=self.db_handler.get_record_by_id(new_person["global_id"]),
-                embedding=sample.embedding,
-                sample=sample.image_path,
-                timestamp=sample.timestamp,
-            )
 
         self.track_to_global_id[track_id] = new_person["global_id"]
         self.track_to_label[track_id] = label
@@ -2473,6 +2853,10 @@ class PersonFaceIdApp(GStreamerApp):
         )
         self._enroll_if_ready(track_id, person_detection, frame, width, height)
 
+    # ------------------------------------------------------------------
+    # GStreamer pipeline construction and frame processing
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _is_pairing_sensitive_queue(queue_name: str) -> bool:
         """Queues inside cropper/aggregator branches should not drop one side of a frame pair."""
@@ -2522,12 +2906,14 @@ class PersonFaceIdApp(GStreamerApp):
             return
 
         active_track_ids: set[int] = set()
+        active_person_detections: dict[int, object] = {}
         timestamp = int(time.time())
         for person_detection in person_detections:
             track_id = self._get_track_id(person_detection)
             if track_id is None:
                 continue
             active_track_ids.add(track_id)
+            active_person_detections[track_id] = person_detection
             event = self.entry_detector.update(
                 track_id=track_id,
                 detection=person_detection,
@@ -2537,6 +2923,7 @@ class PersonFaceIdApp(GStreamerApp):
             if event is not None:
                 self._handle_entry_event(event, person_detection, frame, width, height)
 
+        self._resolve_stale_pending_entries(active_person_detections, frame, width, height)
         self.entry_detector.cleanup(active_track_ids)
 
     def get_pipeline_string(self):
@@ -2617,6 +3004,11 @@ class PersonFaceIdApp(GStreamerApp):
             show_fps=self.show_fps,
         )
 
+        # Pipeline order matters:
+        # face detection -> face tracking -> face embedding callback
+        # person detection -> person tracking -> identity callback.
+        # The identity callback needs both the cached face embedding and the
+        # final person track metadata to bind a face to a person.
         pipeline_string = (
             f"{source_pipeline} ! "
             f"{face_detection_wrapper} ! "
@@ -2635,15 +3027,22 @@ class PersonFaceIdApp(GStreamerApp):
             logger.warning("Received None buffer.")
             return
 
+        # Live config files can be edited while the app is running. Reloading at
+        # callback time keeps the camera process alive while tuning zones/lines.
         self._reload_enroll_zone_file()
         self._reload_entry_lines_file()
 
+        # Keep only person and face detections in the ROI. Other detections from
+        # shared post-processors would confuse the face-to-person matching below.
         roi = hailo.get_roi_from_buffer(buffer)
         removed_detections = self._prune_non_person_detections(roi)
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
         face_detections = [d for d in detections if d.get_label() == "face"]
         person_detections = [d for d in detections if d.get_label() == "person"]
 
+        # Always attach the best currently known label to every person track so
+        # the display/debug branches can show stable IDs even before a new
+        # embedding arrives.
         for person_detection in person_detections:
             person_track_id = self._get_track_id(person_detection)
             if person_track_id is None:
@@ -2673,6 +3072,11 @@ class PersonFaceIdApp(GStreamerApp):
         self._update_entry_counter(person_detections, frame_number, frame, width, height)
         needs_debug_frame = self.debug_face_overlay or self.debug_stream_enabled
 
+        # Recognition flow per face:
+        # 1. Find the person box that contains the face.
+        # 2. Get the embedding from the face branch cache or from this ROI.
+        # 3. If the person track is already known, reuse the existing identity.
+        # 4. Otherwise vote across recent embeddings before enrolling a new person.
         stats = self.recognition_stats
         stats["frames"] += 1
         stats["persons"] += len(person_detections)
@@ -2728,6 +3132,18 @@ class PersonFaceIdApp(GStreamerApp):
                     known_label,
                     1.0,
                     "recognized",
+                )
+                if frame is None:
+                    frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height)
+                self._save_known_person_sample_if_empty(
+                    known_global_id,
+                    known_label,
+                    matched_person_track_id,
+                    frame,
+                    detection,
+                    embedding_vector,
+                    width,
+                    height,
                 )
                 continue
 

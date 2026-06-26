@@ -573,17 +573,10 @@ def list_entry_events(request: Request, limit: int = 100) -> EntryStatsResponse:
 def list_entered_people(request: Request, limit: int = 100) -> EnteredPeopleResponse:
     db = _db(request)
     entry_limit = None if limit <= 0 else limit
-    entered_people = []
-    for event in db.get_entry_events(limit=entry_limit):
-        if event.get("status") != "confirmed":
-            continue
-        global_id = event.get("global_id")
-        if not global_id:
-            continue
-        person = db.get_record_by_id(global_id)
-        if person is None:
-            continue
-        entered_people.append(_entered_person_response(event, person, request))
+    entered_people = [
+        _entered_person_response(row["entry_event"], row["person"], request)
+        for row in db.get_entered_people(limit=entry_limit)
+    ]
 
     return {
         "entered_people": entered_people,
