@@ -8,7 +8,7 @@ High-level flow:
 3. GStreamer/Hailo detects and tracks persons.
 4. Every face is matched back to the containing person box.
 5. The person track is recognized, enrolled as a new person, or left pending.
-6. In entry camera mode, a person track is counted after crossing line A and then line B.
+6. ENTRY adds a person after A -> B; EXIT removes the recognized person after A -> B.
 
 The file is intentionally split into sections below. When adding a second camera,
 keep camera-specific behavior behind CameraMode first, then move shared recognition
@@ -112,9 +112,8 @@ QUEUE_PATTERN = re.compile(
 class CameraMode(str, Enum):
     """Role of the current camera instance.
 
-    Today only ENTRY has counting logic. EXIT is defined now so the next camera
-    can be wired in through one explicit switch instead of scattering
-    "is this entry or exit?" checks through the recognition code.
+    ENTRY enrolls/recognizes people and records entry crossings. EXIT recognizes
+    only active entered people and removes them after an exit crossing.
     """
 
     ENTRY = "entry"
@@ -467,6 +466,18 @@ class PersonFaceIdApp(GStreamerApp):
         self._enroll_zone_file_mtime: float | None = None
         self._reload_enroll_zone_file(force=True)
         self.enroll_zone_anchor = self.options_menu.enroll_zone_anchor
+        self.exit_recognition_zone = self._parse_normalized_zone(
+            self.options_menu.exit_recognition_zone,
+            "--exit-recognition-zone",
+        )
+        self.exit_recognition_zone_file = (
+            self._resolve_live_config_path(self.options_menu.exit_recognition_zone_file)
+            if self.options_menu.exit_recognition_zone_file
+            else None
+        )
+        self._exit_recognition_zone_file_mtime: float | None = None
+        self._reload_exit_recognition_zone_file(force=True)
+        self.exit_recognition_zone_anchor = self.options_menu.exit_recognition_zone_anchor
         self.min_enroll_face_width_ratio = self.options_menu.min_enroll_face_width_ratio
         self.min_enroll_face_height_ratio = self.options_menu.min_enroll_face_height_ratio
         self.max_enroll_edge_margin = self.options_menu.max_enroll_edge_margin
@@ -489,8 +500,8 @@ class PersonFaceIdApp(GStreamerApp):
         self.low_latency_queue_size = max(1, self.options_menu.low_latency_queue_size)
         self.pipeline_latency = max(0, self.options_menu.pipeline_latency_ms)
 
-        # Entry counting is intentionally tied to camera_mode. EXIT mode uses
-        # face recognition only against the already-entered people list.
+        # Entry counting is intentionally tied to camera_mode. EXIT uses its own
+        # recognition zone and crossing detector below.
         self._validate_entry_options()
         self.entry_counter_enabled = (
             self.camera_mode == CameraMode.ENTRY
@@ -520,6 +531,29 @@ class PersonFaceIdApp(GStreamerApp):
         self.entry_lines_file_explicit = self.options_menu.entry_lines_file is not None
         self._entry_lines_file_mtime: float | None = None
         self._reload_entry_lines_file(force=True)
+
+        # Exit uses the same robust A -> B crossing mechanics as entry, but has
+        # independent lines because the second camera has its own perspective.
+        self._validate_exit_options()
+        self.exit_counter_enabled = (
+            self.camera_mode == CameraMode.EXIT
+            and not self.options_menu.disable_exit_counter
+        )
+        self.exit_detector = EntryDetector(
+            line_a_y=self.options_menu.exit_line_a_y,
+            line_b_y=self.options_menu.exit_line_b_y,
+            margin=self.options_menu.exit_line_margin,
+            track_ttl_seconds=self.options_menu.exit_track_ttl_seconds,
+            min_frames_between_lines=self.options_menu.exit_min_frames_between_lines,
+        )
+        self.exit_lines_file = (
+            self._resolve_live_config_path(self.options_menu.exit_lines_file)
+            if self.options_menu.exit_lines_file
+            else self.exit_recognition_zone_file
+        )
+        self.exit_lines_file_explicit = self.options_menu.exit_lines_file is not None
+        self._exit_lines_file_mtime: float | None = None
+        self._reload_exit_lines_file(force=True)
         self._shutdown_started = False
         self._debug_fps = 0.0
         self._debug_fps_frames = 0
@@ -659,6 +693,13 @@ class PersonFaceIdApp(GStreamerApp):
                 self.entry_detector.line_b_y,
                 self.entry_detector.margin,
             )
+        if self.exit_counter_enabled:
+            logger.info(
+                "Exit counter enabled: line_a_y=%.3f line_b_y=%.3f margin=%.3f",
+                self.exit_detector.line_a_y,
+                self.exit_detector.line_b_y,
+                self.exit_detector.margin,
+            )
 
         if self.options_menu.disable_local_display:
             self.video_sink = "fakesink"
@@ -697,7 +738,7 @@ class PersonFaceIdApp(GStreamerApp):
             default=CameraMode.ENTRY.value,
             help=(
                 "Role of this camera instance. 'entry' enables A -> B entry counting. "
-                "'exit' recognizes only people already present in entered_person."
+                "'exit' recognizes entered people and removes them after exit A -> B."
             ),
         )
         parser.add_argument(
@@ -785,6 +826,32 @@ class PersonFaceIdApp(GStreamerApp):
             choices=("person-feet", "person-center", "face-center"),
             default="person-feet",
             help="Point tested against --enroll-zone. Default is bottom-center of the person box.",
+        )
+        parser.add_argument(
+            "--exit-recognition-zone",
+            default=None,
+            help=(
+                "Optional normalized polygon where exit-camera identity recognition is allowed, "
+                "as x1,y1,x2,y2,... . Four numbers define xmin,ymin,xmax,ymax. "
+                "Outside this zone an unbound exit-camera track remains Unknown."
+            ),
+        )
+        parser.add_argument(
+            "--exit-recognition-zone-file",
+            default=None,
+            help=(
+                "Optional text file containing the same normalized polygon as "
+                "--exit-recognition-zone. The file is reloaded while the app is running."
+            ),
+        )
+        parser.add_argument(
+            "--exit-recognition-zone-anchor",
+            choices=("person-feet", "person-center", "face-center"),
+            default="person-feet",
+            help=(
+                "Point tested against --exit-recognition-zone. "
+                "Default is bottom-center of the person box."
+            ),
         )
         parser.add_argument(
             "--max-enroll-edge-margin",
@@ -891,6 +958,50 @@ class PersonFaceIdApp(GStreamerApp):
             ),
         )
         parser.add_argument(
+            "--disable-exit-counter",
+            action="store_true",
+            help="Disable A -> B exit counting for tracked people.",
+        )
+        parser.add_argument(
+            "--exit-line-a-y",
+            type=float,
+            default=0.55,
+            help="Normalized Y coordinate for exit line A. Default: 0.55.",
+        )
+        parser.add_argument(
+            "--exit-line-b-y",
+            type=float,
+            default=0.75,
+            help="Normalized Y coordinate for exit line B. Default: 0.75.",
+        )
+        parser.add_argument(
+            "--exit-line-margin",
+            type=float,
+            default=0.02,
+            help="Normalized hysteresis margin around each exit line. Default: 0.02.",
+        )
+        parser.add_argument(
+            "--exit-track-ttl-seconds",
+            type=float,
+            default=60.0,
+            help="Seconds to keep exit state for disappeared tracks. Default: 60.",
+        )
+        parser.add_argument(
+            "--exit-min-frames-between-lines",
+            type=int,
+            default=0,
+            help="Minimum frame gap between crossing exit line A and B. Default: 0.",
+        )
+        parser.add_argument(
+            "--exit-lines-file",
+            default=None,
+            help=(
+                "Optional text file reloaded while running. Supports exit_line_a_y, "
+                "exit_line_b_y and exit_line_margin. If omitted, the app also looks "
+                "for these keys in --exit-recognition-zone-file."
+            ),
+        )
+        parser.add_argument(
             "--disable-debug-stream",
             action="store_true",
             help="Disable the built-in Flask MJPEG debug stream.",
@@ -979,22 +1090,48 @@ class PersonFaceIdApp(GStreamerApp):
         if self.options_menu.entry_pending_resolution_seconds < 0:
             raise ValueError("--entry-pending-resolution-seconds must be >= 0.")
 
+    def _validate_exit_options(self) -> None:
+        self._validate_crossing_values(
+            self.options_menu.exit_line_a_y,
+            self.options_menu.exit_line_b_y,
+            self.options_menu.exit_line_margin,
+            "exit",
+        )
+        if self.options_menu.exit_track_ttl_seconds < 0:
+            raise ValueError("--exit-track-ttl-seconds must be >= 0.")
+        if self.options_menu.exit_min_frames_between_lines < 0:
+            raise ValueError("--exit-min-frames-between-lines must be >= 0.")
+
     @staticmethod
     def _validate_entry_values(line_a_y: float, line_b_y: float, margin: float) -> None:
+        PersonFaceIdApp._validate_crossing_values(line_a_y, line_b_y, margin, "entry")
+
+    @staticmethod
+    def _validate_crossing_values(
+        line_a_y: float,
+        line_b_y: float,
+        margin: float,
+        prefix: str,
+    ) -> None:
         values = {
-            "entry-line-a-y": line_a_y,
-            "entry-line-b-y": line_b_y,
-            "entry-line-margin": margin,
+            f"{prefix}-line-a-y": line_a_y,
+            f"{prefix}-line-b-y": line_b_y,
+            f"{prefix}-line-margin": margin,
         }
         for cli_name, value in values.items():
             if not 0.0 <= value <= 1.0:
                 raise ValueError(f"--{cli_name} must be normalized from 0.0 to 1.0.")
 
         if line_a_y == line_b_y:
-            raise ValueError("--entry-line-a-y and --entry-line-b-y must be different.")
+            raise ValueError(
+                f"--{prefix}-line-a-y and --{prefix}-line-b-y must be different."
+            )
 
     @staticmethod
-    def _parse_enroll_zone(value: str | None) -> list[tuple[float, float]] | None:
+    def _parse_normalized_zone(
+        value: str | None,
+        option_name: str,
+    ) -> list[tuple[float, float]] | None:
         if value is None or not value.strip():
             return None
 
@@ -1002,7 +1139,7 @@ class PersonFaceIdApp(GStreamerApp):
             coordinates = [float(part.strip()) for part in value.split(",")]
         except ValueError as exc:
             raise ValueError(
-                "--enroll-zone must contain comma-separated numbers: x1,y1,x2,y2,..."
+                f"{option_name} must contain comma-separated numbers: x1,y1,x2,y2,..."
             ) from exc
 
         if len(coordinates) == 4:
@@ -1010,7 +1147,7 @@ class PersonFaceIdApp(GStreamerApp):
             coordinates = [x1, y1, x2, y1, x2, y2, x1, y2]
 
         if len(coordinates) < 6 or len(coordinates) % 2 != 0:
-            raise ValueError("--enroll-zone must define at least three x,y points.")
+            raise ValueError(f"{option_name} must define at least three x,y points.")
 
         points = [
             (coordinates[index], coordinates[index + 1])
@@ -1018,8 +1155,14 @@ class PersonFaceIdApp(GStreamerApp):
         ]
         for x, y in points:
             if not 0.0 <= x <= 1.0 or not 0.0 <= y <= 1.0:
-                raise ValueError("--enroll-zone coordinates must be normalized from 0.0 to 1.0.")
+                raise ValueError(
+                    f"{option_name} coordinates must be normalized from 0.0 to 1.0."
+                )
         return points
+
+    @staticmethod
+    def _parse_enroll_zone(value: str | None) -> list[tuple[float, float]] | None:
+        return PersonFaceIdApp._parse_normalized_zone(value, "--enroll-zone")
 
     @staticmethod
     def _read_enroll_zone_file(path: Path) -> str | None:
@@ -1030,7 +1173,14 @@ class PersonFaceIdApp(GStreamerApp):
             if "=" in line:
                 key, value = line.split("=", 1)
                 key = key.strip().lower().replace("-", "_")
-                if key in {"entry_line_a_y", "entry_line_b_y", "entry_line_margin"}:
+                if key in {
+                    "entry_line_a_y",
+                    "entry_line_b_y",
+                    "entry_line_margin",
+                    "exit_line_a_y",
+                    "exit_line_b_y",
+                    "exit_line_margin",
+                }:
                     continue
                 line = value.strip()
             return line
@@ -1078,6 +1228,32 @@ class PersonFaceIdApp(GStreamerApp):
 
         return values or None
 
+    @staticmethod
+    def _read_exit_lines_file(path: Path) -> dict[str, float] | None:
+        values: dict[str, float] = {}
+        aliases = {
+            "exit_line_a_y": "exit_line_a_y",
+            "line_a_y": "exit_line_a_y",
+            "line_a": "exit_line_a_y",
+            "a": "exit_line_a_y",
+            "exit_line_b_y": "exit_line_b_y",
+            "line_b_y": "exit_line_b_y",
+            "line_b": "exit_line_b_y",
+            "b": "exit_line_b_y",
+            "exit_line_margin": "exit_line_margin",
+            "line_margin": "exit_line_margin",
+            "margin": "exit_line_margin",
+        }
+        for raw_line in path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, raw_value = line.split("=", 1)
+            target_key = aliases.get(key.strip().lower().replace("-", "_"))
+            if target_key is not None:
+                values[target_key] = float(raw_value.strip())
+        return values or None
+
     def _reload_enroll_zone_file(self, force: bool = False) -> None:
         if self.enroll_zone_file is None:
             return
@@ -1100,6 +1276,44 @@ class PersonFaceIdApp(GStreamerApp):
         except (OSError, ValueError) as exc:
             self._enroll_zone_file_mtime = mtime
             logger.warning("Keeping previous enrollment zone; failed to read %s: %s", self.enroll_zone_file, exc)
+
+    def _reload_exit_recognition_zone_file(self, force: bool = False) -> None:
+        if self.exit_recognition_zone_file is None:
+            return
+
+        try:
+            mtime = self.exit_recognition_zone_file.stat().st_mtime
+        except OSError as exc:
+            if force:
+                logger.warning(
+                    "Exit recognition zone file is not readable: %s (%s)",
+                    self.exit_recognition_zone_file,
+                    exc,
+                )
+            return
+
+        if not force and self._exit_recognition_zone_file_mtime == mtime:
+            return
+
+        try:
+            zone_value = self._read_enroll_zone_file(self.exit_recognition_zone_file)
+            self.exit_recognition_zone = self._parse_normalized_zone(
+                zone_value,
+                "--exit-recognition-zone",
+            )
+            self._exit_recognition_zone_file_mtime = mtime
+            logger.info(
+                "Reloaded exit recognition zone from %s: %s",
+                self.exit_recognition_zone_file,
+                zone_value,
+            )
+        except (OSError, ValueError) as exc:
+            self._exit_recognition_zone_file_mtime = mtime
+            logger.warning(
+                "Keeping previous exit recognition zone; failed to read %s: %s",
+                self.exit_recognition_zone_file,
+                exc,
+            )
 
     def _reload_entry_lines_file(self, force: bool = False) -> None:
         if self.entry_lines_file is None:
@@ -1140,6 +1354,45 @@ class PersonFaceIdApp(GStreamerApp):
             logger.warning(
                 "Keeping previous entry lines; failed to read %s: %s",
                 self.entry_lines_file,
+                exc,
+            )
+
+    def _reload_exit_lines_file(self, force: bool = False) -> None:
+        if self.exit_lines_file is None:
+            return
+        try:
+            mtime = self.exit_lines_file.stat().st_mtime
+        except OSError as exc:
+            if force and self.exit_lines_file_explicit:
+                logger.warning("Exit lines file is not readable: %s (%s)", self.exit_lines_file, exc)
+            return
+        if not force and self._exit_lines_file_mtime == mtime:
+            return
+
+        try:
+            values = self._read_exit_lines_file(self.exit_lines_file)
+            self._exit_lines_file_mtime = mtime
+            if not values:
+                return
+            line_a_y = values.get("exit_line_a_y", self.exit_detector.line_a_y)
+            line_b_y = values.get("exit_line_b_y", self.exit_detector.line_b_y)
+            margin = values.get("exit_line_margin", self.exit_detector.margin)
+            self._validate_crossing_values(line_a_y, line_b_y, margin, "exit")
+            self.exit_detector.line_a_y = line_a_y
+            self.exit_detector.line_b_y = line_b_y
+            self.exit_detector.margin = margin
+            logger.info(
+                "Reloaded exit lines from %s: line_a_y=%.3f line_b_y=%.3f margin=%.3f",
+                self.exit_lines_file,
+                line_a_y,
+                line_b_y,
+                margin,
+            )
+        except (OSError, ValueError) as exc:
+            self._exit_lines_file_mtime = mtime
+            logger.warning(
+                "Keeping previous exit lines; failed to read %s: %s",
+                self.exit_lines_file,
                 exc,
             )
 
@@ -1427,6 +1680,15 @@ class PersonFaceIdApp(GStreamerApp):
                 entered_person["person"],
                 entered_person["entry_event"],
             )
+
+    def _forget_entered_person(self, entry_event_id: str) -> None:
+        """Remove one active entry from the exit camera's in-memory view."""
+        self.entered_people_by_entry_event_id.pop(entry_event_id, None)
+        self.entered_people = [
+            item
+            for item in self.entered_people
+            if item.get("entry_event_id") != entry_event_id
+        ]
 
     def _record_visit_snapshot(
         self,
@@ -1875,6 +2137,84 @@ class PersonFaceIdApp(GStreamerApp):
             height=height,
         )
 
+    def _mark_known_person_exited(
+        self,
+        global_id: str,
+        label: str,
+        track_id: int,
+        confidence: float,
+        exit_event: EntryEvent,
+    ) -> None:
+        record = self.db_handler.mark_person_exited(
+            global_id=global_id,
+            timestamp=exit_event.entered_at,
+            track_id=track_id,
+        )
+        # Mark this physical crossing as handled even if another process already
+        # removed the active row, so one track cannot repeatedly emit an exit.
+        self.exit_detector.mark_entry_counted(track_id, global_id)
+        if record is None:
+            logger.warning(
+                "Exit crossed but no active entered_person row exists: "
+                "track_id=%d global_id=%s",
+                track_id,
+                global_id,
+            )
+            return
+
+        exited_entry_event_id = record["exited_entry_event_id"]
+        self._forget_entered_person(exited_entry_event_id)
+        total_entered = int(record["total_entered"])
+        print(
+            f"exited: exit_event_id={exit_event.entry_event_id} "
+            f"entry_event_id={exited_entry_event_id} track_id={track_id} "
+            f"global_id={global_id} label={label} total_entered={total_entered}"
+        )
+        self._notify_frontend(
+            "exited",
+            global_id,
+            label,
+            track_id,
+            confidence,
+            entry_event_id=exited_entry_event_id,
+            total_entered=total_entered,
+        )
+
+    def _handle_exit_event(self, event: EntryEvent) -> None:
+        global_id = self.track_to_global_id.get(event.track_id)
+        if global_id is None:
+            logger.info(
+                "Exit A -> B is waiting for identity: exit_event_id=%s track_id=%d",
+                event.entry_event_id,
+                event.track_id,
+            )
+            return
+        self._mark_known_person_exited(
+            global_id=global_id,
+            label=self.track_to_label.get(event.track_id, global_id),
+            track_id=event.track_id,
+            confidence=1.0,
+            exit_event=event,
+        )
+
+    def _apply_pending_exit_for_track(
+        self,
+        track_id: int,
+        global_id: str,
+        label: str,
+        confidence: float,
+    ) -> None:
+        exit_event = self.exit_detector.uncounted_entry_event(track_id)
+        if exit_event is None:
+            return
+        self._mark_known_person_exited(
+            global_id=global_id,
+            label=label,
+            track_id=track_id,
+            confidence=confidence,
+            exit_event=exit_event,
+        )
+
     # ------------------------------------------------------------------
     # Pipeline hooks
     # ------------------------------------------------------------------
@@ -1982,44 +2322,77 @@ class PersonFaceIdApp(GStreamerApp):
             cv2.LINE_AA,
         )
 
-    def _draw_enroll_zone(self, frame: np.ndarray, width: int, height: int) -> None:
-        if not self.enroll_zone:
+    @staticmethod
+    def _draw_zone(
+        frame: np.ndarray,
+        width: int,
+        height: int,
+        zone: list[tuple[float, float]] | None,
+        label_text: str,
+        color: tuple[int, int, int],
+    ) -> None:
+        if not zone:
             return
 
         points = np.array(
             [
                 (int(x * width), int(y * height))
-                for x, y in self.enroll_zone
+                for x, y in zone
             ],
             dtype=np.int32,
         )
-        cv2.polylines(frame, [points], isClosed=True, color=(255, 190, 40), thickness=2)
-        for index, (x_norm, y_norm) in enumerate(self.enroll_zone, start=1):
+        cv2.polylines(frame, [points], isClosed=True, color=color, thickness=2)
+        for index, (x_norm, y_norm) in enumerate(zone, start=1):
             x = int(x_norm * width)
             y = int(y_norm * height)
             label = f"{index}:{x_norm:.2f},{y_norm:.2f}"
-            cv2.circle(frame, (x, y), 5, (255, 190, 40), -1)
+            cv2.circle(frame, (x, y), 5, color, -1)
             cv2.putText(
                 frame,
                 label,
                 (min(width - 120, max(8, x + 8)), min(height - 8, max(18, y - 8))),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.42,
-                (255, 190, 40),
+                color,
                 1,
                 cv2.LINE_AA,
             )
-        label_x = int(min(x for x, _ in self.enroll_zone) * width)
-        label_y = int(min(y for _, y in self.enroll_zone) * height)
+        label_x = int(min(x for x, _ in zone) * width)
+        label_y = int(min(y for _, y in zone) * height)
         cv2.putText(
             frame,
-            "enroll zone",
+            label_text,
             (max(8, label_x), max(24, label_y - 6)),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (255, 190, 40),
+            color,
             2,
             cv2.LINE_AA,
+        )
+
+    def _draw_active_recognition_zone(
+        self,
+        frame: np.ndarray,
+        width: int,
+        height: int,
+    ) -> None:
+        if self.camera_mode == CameraMode.EXIT:
+            self._draw_zone(
+                frame,
+                width,
+                height,
+                self.exit_recognition_zone,
+                "exit recognition zone",
+                (190, 80, 255),
+            )
+            return
+        self._draw_zone(
+            frame,
+            width,
+            height,
+            self.enroll_zone,
+            "enroll zone",
+            (255, 190, 40),
         )
 
     def _draw_enroll_anchor(
@@ -2043,6 +2416,35 @@ class PersonFaceIdApp(GStreamerApp):
         cv2.line(frame, (x - 12, y), (x + 12, y), color, 1)
         cv2.line(frame, (x, y - 12), (x, y + 12), color, 1)
 
+    def _draw_exit_recognition_anchor(
+        self,
+        frame: np.ndarray,
+        person_detection,
+        width: int,
+        height: int,
+    ) -> None:
+        if (
+            self.camera_mode != CameraMode.EXIT
+            or self.exit_recognition_zone_anchor == "face-center"
+        ):
+            return
+
+        point = self._zone_anchor_point(
+            self.exit_recognition_zone_anchor,
+            person_detection,
+            None,
+        )
+        x = int(max(0.0, min(point[0], 1.0)) * width)
+        y = int(max(0.0, min(point[1], 1.0)) * height)
+        inside = (
+            self._point_in_polygon(point, self.exit_recognition_zone)
+            if self.exit_recognition_zone
+            else True
+        )
+        color = (40, 220, 90) if inside else (80, 80, 255)
+        cv2.circle(frame, (x, y), 6, color, -1)
+        cv2.circle(frame, (x, y), 10, color, 2)
+
     def _draw_entry_lines(self, frame: np.ndarray, width: int, height: int) -> None:
         if not self.entry_counter_enabled:
             return
@@ -2057,6 +2459,27 @@ class PersonFaceIdApp(GStreamerApp):
             cv2.putText(
                 frame,
                 f"LINE {name}",
+                (12, max(18, y - 8)),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.55,
+                color,
+                2,
+                cv2.LINE_AA,
+            )
+
+    def _draw_exit_lines(self, frame: np.ndarray, width: int, height: int) -> None:
+        if not self.exit_counter_enabled:
+            return
+        lines = [
+            ("EXIT A", self.exit_detector.line_a_y, (190, 80, 255)),
+            ("EXIT B", self.exit_detector.line_b_y, (80, 220, 255)),
+        ]
+        for name, y_norm, color in lines:
+            y = int(max(0.0, min(y_norm, 1.0)) * height)
+            cv2.line(frame, (0, y), (width - 1, y), color, 2)
+            cv2.putText(
+                frame,
+                name,
                 (12, max(18, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
@@ -2094,6 +2517,36 @@ class PersonFaceIdApp(GStreamerApp):
             cv2.LINE_AA,
         )
 
+    def _draw_exit_anchor(
+        self,
+        frame: np.ndarray,
+        person_detection,
+        track_id: int | None,
+        width: int,
+        height: int,
+    ) -> None:
+        if not self.exit_counter_enabled or track_id is None:
+            return
+
+        point = self.exit_detector.anchor_point(person_detection)
+        x = int(max(0.0, min(point[0], 1.0)) * width)
+        y = int(max(0.0, min(point[1], 1.0)) * height)
+        state = self.exit_detector.tracks.get(track_id)
+        stage = state.stage if state is not None else "outside"
+        display_stage = "exited" if stage == "entered" else stage
+        color = (60, 220, 120) if display_stage == "exited" else (190, 80, 255)
+        cv2.circle(frame, (x, y), 5, color, -1)
+        cv2.putText(
+            frame,
+            display_stage,
+            (min(width - 120, max(8, x + 8)), min(height - 8, max(18, y - 8))),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.42,
+            color,
+            1,
+            cv2.LINE_AA,
+        )
+
     def _update_debug_fps(self) -> None:
         self._debug_fps_frames += 1
         now = time.time()
@@ -2113,8 +2566,9 @@ class PersonFaceIdApp(GStreamerApp):
         height: int,
         frame_number: int,
     ) -> None:
-        self._draw_enroll_zone(frame, width, height)
+        self._draw_active_recognition_zone(frame, width, height)
         self._draw_entry_lines(frame, width, height)
+        self._draw_exit_lines(frame, width, height)
 
         for person_detection in person_detections:
             track_id = self._get_track_id(person_detection)
@@ -2131,8 +2585,12 @@ class PersonFaceIdApp(GStreamerApp):
                 label,
                 color=(255, 70, 70),
             )
-            self._draw_enroll_anchor(frame, person_detection, width, height)
+            if self.camera_mode == CameraMode.ENTRY:
+                self._draw_enroll_anchor(frame, person_detection, width, height)
+            else:
+                self._draw_exit_recognition_anchor(frame, person_detection, width, height)
             self._draw_entry_anchor(frame, person_detection, track_id, width, height)
+            self._draw_exit_anchor(frame, person_detection, track_id, width, height)
 
         for face_detection in face_detections:
             track_id = self._get_track_id(face_detection)
@@ -2214,22 +2672,44 @@ class PersonFaceIdApp(GStreamerApp):
             previous_x, previous_y = current_x, current_y
         return inside
 
-    def _enroll_zone_anchor_point(self, person_detection, face_detection) -> tuple[float, float]:
-        if self.enroll_zone_anchor == "face-center":
+    @staticmethod
+    def _zone_anchor_point(
+        anchor: str,
+        person_detection,
+        face_detection,
+    ) -> tuple[float, float]:
+        if anchor == "face-center":
             bbox = face_detection.get_bbox()
         else:
             bbox = person_detection.get_bbox()
 
         x_center = (bbox.xmin() + bbox.xmax()) / 2.0
-        if self.enroll_zone_anchor == "person-feet":
+        if anchor == "person-feet":
             return x_center, bbox.ymax()
         return x_center, (bbox.ymin() + bbox.ymax()) / 2.0
+
+    def _enroll_zone_anchor_point(self, person_detection, face_detection) -> tuple[float, float]:
+        return self._zone_anchor_point(
+            self.enroll_zone_anchor,
+            person_detection,
+            face_detection,
+        )
 
     def _is_inside_enroll_zone(self, person_detection, face_detection) -> bool:
         if not self.enroll_zone:
             return True
         point = self._enroll_zone_anchor_point(person_detection, face_detection)
         return self._point_in_polygon(point, self.enroll_zone)
+
+    def _is_inside_exit_recognition_zone(self, person_detection, face_detection) -> bool:
+        if not self.exit_recognition_zone:
+            return True
+        point = self._zone_anchor_point(
+            self.exit_recognition_zone_anchor,
+            person_detection,
+            face_detection,
+        )
+        return self._point_in_polygon(point, self.exit_recognition_zone)
 
     @staticmethod
     def _bbox_area(box: tuple[int, int, int, int]) -> int:
@@ -2596,6 +3076,12 @@ class PersonFaceIdApp(GStreamerApp):
             confidence,
             "recognized-entered",
         )
+        self._apply_pending_exit_for_track(
+            track_id,
+            person["global_id"],
+            person["label"],
+            confidence,
+        )
 
     def _bind_existing_person_from_vote(
         self,
@@ -2955,6 +3441,28 @@ class PersonFaceIdApp(GStreamerApp):
         self._resolve_stale_pending_entries(active_person_detections, frame, width, height)
         self.entry_detector.cleanup(active_track_ids)
 
+    def _update_exit_counter(self, person_detections, frame_number: int) -> None:
+        if not self.exit_counter_enabled:
+            return
+
+        active_track_ids: set[int] = set()
+        timestamp = int(time.time())
+        for person_detection in person_detections:
+            track_id = self._get_track_id(person_detection)
+            if track_id is None:
+                continue
+            active_track_ids.add(track_id)
+            event = self.exit_detector.update(
+                track_id=track_id,
+                detection=person_detection,
+                frame_number=frame_number,
+                timestamp=timestamp,
+            )
+            if event is not None:
+                self._handle_exit_event(event)
+
+        self.exit_detector.cleanup(active_track_ids)
+
     def get_pipeline_string(self):
         source_kwargs = {}
         if self.frame_rate is not None:
@@ -3059,7 +3567,9 @@ class PersonFaceIdApp(GStreamerApp):
         # Live config files can be edited while the app is running. Reloading at
         # callback time keeps the camera process alive while tuning zones/lines.
         self._reload_enroll_zone_file()
+        self._reload_exit_recognition_zone_file()
         self._reload_entry_lines_file()
+        self._reload_exit_lines_file()
 
         # Keep only person and face detections in the ROI. Other detections from
         # shared post-processors would confuse the face-to-person matching below.
@@ -3099,6 +3609,7 @@ class PersonFaceIdApp(GStreamerApp):
             else None
         )
         self._update_entry_counter(person_detections, frame_number, frame, width, height)
+        self._update_exit_counter(person_detections, frame_number)
         needs_debug_frame = self.debug_face_overlay or self.debug_stream_enabled
 
         # Recognition flow per face:
@@ -3190,6 +3701,12 @@ class PersonFaceIdApp(GStreamerApp):
             )
 
             if self.camera_mode == CameraMode.EXIT:
+                if not self._is_inside_exit_recognition_zone(matched_person, detection):
+                    logger.debug(
+                        "Exit track_id=%d is outside the recognition zone",
+                        matched_person_track_id,
+                    )
+                    continue
                 person, confidence = self._recognize_entered_embedding(embedding_vector)
                 if person["label"] == "Unknown":
                     stats["unknown"] += 1

@@ -758,6 +758,64 @@ class SQLiteDatabaseHandler:
             ).fetchone()
             return int(row["total"] if row is not None else 0)
 
+    def mark_person_exited(
+        self,
+        global_id: str,
+        timestamp: int,
+        track_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Remove one active entered-person link after a confirmed exit."""
+        with self._lock, self._connection:
+            entered_row = self._connection.execute(
+                """
+                SELECT id, entry_event_id
+                FROM entered_person
+                WHERE global_id = ?
+                ORDER BY entered_at ASC, created_at ASC
+                LIMIT 1
+                """,
+                (global_id,),
+            ).fetchone()
+            if entered_row is None:
+                return None
+
+            # Keep the historical entry event, but mark it as no longer active.
+            # Otherwise startup backfill would recreate this entered_person row.
+            self._connection.execute(
+                """
+                UPDATE entry_events
+                SET status = 'exited',
+                    updated_at = ?
+                WHERE id = ?
+                """,
+                (timestamp, entered_row["entry_event_id"]),
+            )
+            self._connection.execute(
+                "DELETE FROM entered_person WHERE id = ?",
+                (entered_row["id"],),
+            )
+            self._connection.execute(
+                """
+                UPDATE persons
+                SET last_seen_at = ?,
+                    last_seen_track_id = COALESCE(?, last_seen_track_id)
+                WHERE global_id = ?
+                """,
+                (timestamp, track_id, global_id),
+            )
+            person_row = self._connection.execute(
+                "SELECT * FROM persons WHERE global_id = ?",
+                (global_id,),
+            ).fetchone()
+            if person_row is None:
+                return None
+
+            record = self._row_to_record(person_row)
+            record["exited_entry_event_id"] = entered_row["entry_event_id"]
+            record["exited_at"] = timestamp
+            record["total_entered"] = self.get_total_entered()
+            return record
+
     def get_entry_events(self, limit: int | None = 100) -> list[dict[str, Any]]:
         with self._lock:
             if limit is None:

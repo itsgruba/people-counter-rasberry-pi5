@@ -89,6 +89,7 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
 
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --camera-mode exit \
+  --exit-recognition-zone-file exit_recognition_zone.txt
   --input http://192.168.8.6:8080/stream \
   --width 640 \
   --height 640 \
@@ -97,6 +98,9 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --disable-local-display \
   --debug-stream-port 8091 \
   --notify-url http://192.168.8.6:8000/api/events
+
+cd hailo_apps/my_projects/auto_face_id
+fastapi dev person_face_api.py --host 0.0.0.0
 ```
 
 ## Notes
