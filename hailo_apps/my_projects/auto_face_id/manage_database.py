@@ -71,11 +71,6 @@ def _sample_files_in_use(db: SQLiteDatabaseHandler) -> set[Path]:
             photo_path = visit.get("photo_path")
             if photo_path:
                 files.add(Path(photo_path).resolve())
-    for event in db.get_entry_events(limit=1000):
-        for key in ("entry_photo_path", "confirmed_photo_path"):
-            photo_path = event.get(key)
-            if photo_path:
-                files.add(Path(photo_path).resolve())
     return files
 
 

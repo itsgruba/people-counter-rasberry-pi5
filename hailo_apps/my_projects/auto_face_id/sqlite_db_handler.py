@@ -42,8 +42,7 @@ class SQLiteDatabaseHandler:
         self._connection.execute("PRAGMA synchronous = NORMAL")
         self._create_schema()
         self._ensure_person_columns()
-        self._ensure_entry_event_columns()
-        self._backfill_entered_person()
+        self._migrate_legacy_entry_storage()
         self._embedding_cache: dict[str, np.ndarray] = {}
         self._sample_embedding_cache: list[tuple[str, np.ndarray]] = []
         self._reload_embedding_cache()
@@ -94,45 +93,15 @@ class SQLiteDatabaseHandler:
                 CREATE INDEX IF NOT EXISTS idx_visits_person_id
                 ON visits(person_id);
 
-                CREATE TABLE IF NOT EXISTS entry_events (
-                    id TEXT PRIMARY KEY,
-                    status TEXT NOT NULL,
-                    detected_at INTEGER NOT NULL,
-                    confirmed_at INTEGER,
-                    track_id INTEGER,
-                    global_id TEXT,
-                    label TEXT NOT NULL DEFAULT 'Unknown',
-                    entry_photo_path TEXT,
-                    confirmed_photo_path TEXT,
-                    frame_number INTEGER,
-                    point_x REAL,
-                    point_y REAL,
-                    created_at INTEGER NOT NULL,
-                    updated_at INTEGER NOT NULL,
-                    FOREIGN KEY (global_id) REFERENCES persons(global_id) ON DELETE SET NULL
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_entry_events_status
-                ON entry_events(status);
-
-                CREATE INDEX IF NOT EXISTS idx_entry_events_detected_at
-                ON entry_events(detected_at);
-
                 CREATE TABLE IF NOT EXISTS entered_person (
-                    id TEXT PRIMARY KEY,
-                    entry_event_id TEXT UNIQUE NOT NULL,
-                    global_id TEXT NOT NULL,
+                    global_id TEXT PRIMARY KEY,
                     label TEXT NOT NULL,
                     entered_at INTEGER NOT NULL,
                     track_id INTEGER,
                     created_at INTEGER NOT NULL,
                     updated_at INTEGER NOT NULL,
-                    FOREIGN KEY (entry_event_id) REFERENCES entry_events(id) ON DELETE CASCADE,
                     FOREIGN KEY (global_id) REFERENCES persons(global_id) ON DELETE CASCADE
                 );
-
-                CREATE INDEX IF NOT EXISTS idx_entered_person_global_id
-                ON entered_person(global_id);
 
                 CREATE INDEX IF NOT EXISTS idx_entered_person_entered_at
                 ON entered_person(entered_at);
@@ -162,56 +131,81 @@ class SQLiteDatabaseHandler:
                 if column_name not in columns:
                     self._connection.execute(statement)
 
-    def _ensure_entry_event_columns(self) -> None:
-        """Add new columns to older entry event tables without requiring a manual migration."""
-        columns = {
+    def _migrate_legacy_entry_storage(self) -> None:
+        """Keep active people while replacing the old entry-history schema."""
+        entered_columns = {
             row["name"]
-            for row in self._connection.execute("PRAGMA table_info(entry_events)").fetchall()
+            for row in self._connection.execute("PRAGMA table_info(entered_person)").fetchall()
         }
-        migrations = [
-            ("entry_photo_path", "ALTER TABLE entry_events ADD COLUMN entry_photo_path TEXT"),
-            (
-                "confirmed_photo_path",
-                "ALTER TABLE entry_events ADD COLUMN confirmed_photo_path TEXT",
-            ),
-        ]
-        with self._connection:
-            for column_name, statement in migrations:
-                if column_name not in columns:
-                    self._connection.execute(statement)
-
-    def _backfill_entered_person(self) -> None:
-        """Create explicit entered-person links for older confirmed entry events."""
-        now = int(time.time())
-        with self._connection:
+        has_legacy_entered_table = "entry_event_id" in entered_columns
+        has_legacy_events = (
             self._connection.execute(
                 """
-                INSERT INTO entered_person (
-                    id,
-                    entry_event_id,
-                    global_id,
-                    label,
-                    entered_at,
-                    track_id,
-                    created_at,
-                    updated_at
+                SELECT 1
+                FROM sqlite_master
+                WHERE type = 'table' AND name = 'entry_events'
+                """
+            ).fetchone()
+            is not None
+        )
+        if not has_legacy_entered_table and not has_legacy_events:
+            return
+
+        with self._connection:
+            if has_legacy_entered_table:
+                self._connection.execute(
+                    """
+                    CREATE TABLE IF NOT EXISTS entered_person_v2 (
+                        global_id TEXT PRIMARY KEY,
+                        label TEXT NOT NULL,
+                        entered_at INTEGER NOT NULL,
+                        track_id INTEGER,
+                        created_at INTEGER NOT NULL,
+                        updated_at INTEGER NOT NULL,
+                        FOREIGN KEY (global_id) REFERENCES persons(global_id) ON DELETE CASCADE
+                    )
+                    """
                 )
-                SELECT
-                    lower(hex(randomblob(16))),
-                    entry_events.id,
-                    entry_events.global_id,
-                    entry_events.label,
-                    COALESCE(entry_events.confirmed_at, entry_events.detected_at),
-                    entry_events.track_id,
-                    ?,
-                    ?
-                FROM entry_events
-                JOIN persons ON persons.global_id = entry_events.global_id
-                WHERE entry_events.status = 'confirmed'
-                    AND entry_events.global_id IS NOT NULL
-                ON CONFLICT(entry_event_id) DO NOTHING
+                rows = self._connection.execute(
+                    """
+                    SELECT global_id, label, entered_at, track_id, created_at, updated_at
+                    FROM entered_person
+                    ORDER BY entered_at ASC
+                    """
+                ).fetchall()
+                for row in rows:
+                    self._connection.execute(
+                        """
+                        INSERT INTO entered_person_v2 (
+                            global_id, label, entered_at, track_id, created_at, updated_at
+                        )
+                        VALUES (?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(global_id) DO UPDATE SET
+                            label = excluded.label,
+                            entered_at = excluded.entered_at,
+                            track_id = excluded.track_id,
+                            updated_at = excluded.updated_at
+                        """,
+                        (
+                            row["global_id"],
+                            row["label"],
+                            row["entered_at"],
+                            row["track_id"],
+                            row["created_at"],
+                            row["updated_at"],
+                        ),
+                    )
+                self._connection.execute("DROP TABLE entered_person")
+                self._connection.execute("ALTER TABLE entered_person_v2 RENAME TO entered_person")
+
+            if has_legacy_events:
+                self._connection.execute("DROP TABLE entry_events")
+
+            self._connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_entered_person_entered_at
+                ON entered_person(entered_at)
                 """,
-                (now, now),
             )
 
     @staticmethod
@@ -507,249 +501,6 @@ class SQLiteDatabaseHandler:
             record["visit_incremented"] = should_increment
             return record
 
-    def _entry_event_record(self, row: sqlite3.Row | None) -> dict[str, Any] | None:
-        if row is None:
-            return None
-        return {
-            "id": row["id"],
-            "status": row["status"],
-            "detected_at": row["detected_at"],
-            "confirmed_at": row["confirmed_at"],
-            "track_id": row["track_id"],
-            "global_id": row["global_id"],
-            "label": row["label"],
-            "entry_photo_path": row["entry_photo_path"],
-            "confirmed_photo_path": row["confirmed_photo_path"],
-            "frame_number": row["frame_number"],
-            "point_x": row["point_x"],
-            "point_y": row["point_y"],
-        }
-
-    def register_entry_pending(
-        self,
-        entry_event_id: str,
-        timestamp: int,
-        track_id: int | None,
-        frame_number: int | None = None,
-        point: tuple[float, float] | None = None,
-        entry_photo_path: str | None = None,
-    ) -> dict[str, Any]:
-        """Store one physical A -> B crossing before identity is known."""
-        point_x = point[0] if point is not None else None
-        point_y = point[1] if point is not None else None
-        now = int(time.time())
-        with self._lock, self._connection:
-            self._connection.execute(
-                """
-                INSERT INTO entry_events (
-                    id,
-                    status,
-                    detected_at,
-                    track_id,
-                    label,
-                    entry_photo_path,
-                    frame_number,
-                    point_x,
-                    point_y,
-                    created_at,
-                    updated_at
-                )
-                VALUES (?, 'pending', ?, ?, 'Unknown', ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    detected_at = entry_events.detected_at,
-                    track_id = COALESCE(entry_events.track_id, excluded.track_id),
-                    entry_photo_path = COALESCE(
-                        entry_events.entry_photo_path,
-                        excluded.entry_photo_path
-                    ),
-                    frame_number = COALESCE(entry_events.frame_number, excluded.frame_number),
-                    point_x = COALESCE(entry_events.point_x, excluded.point_x),
-                    point_y = COALESCE(entry_events.point_y, excluded.point_y),
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    entry_event_id,
-                    timestamp,
-                    track_id,
-                    entry_photo_path,
-                    frame_number,
-                    point_x,
-                    point_y,
-                    now,
-                    now,
-                ),
-            )
-            row = self._connection.execute(
-                "SELECT * FROM entry_events WHERE id = ?",
-                (entry_event_id,),
-            ).fetchone()
-            event = self._entry_event_record(row)
-            if event is None:
-                raise RuntimeError("Failed to store pending entry event.")
-            event["total_entered"] = self.get_total_entered()
-            return event
-
-    def mark_person_entered(
-        self,
-        global_id: str,
-        timestamp: int,
-        track_id: int | None = None,
-        entry_event_id: str | None = None,
-        detected_at: int | None = None,
-        frame_number: int | None = None,
-        point: tuple[float, float] | None = None,
-        confirmed_photo_path: str | None = None,
-    ) -> dict[str, Any] | None:
-        """Increment the persisted A -> B entry counter for a known person."""
-        entry_event_id = entry_event_id or str(uuid.uuid4())
-        detected_at = detected_at or timestamp
-        point_x = point[0] if point is not None else None
-        point_y = point[1] if point is not None else None
-        now = int(time.time())
-
-        with self._lock, self._connection:
-            row = self._connection.execute(
-                "SELECT * FROM persons WHERE global_id = ?",
-                (global_id,),
-            ).fetchone()
-            if row is None:
-                return None
-            event_row = self._connection.execute(
-                "SELECT * FROM entry_events WHERE id = ?",
-                (entry_event_id,),
-            ).fetchone()
-            already_confirmed = (
-                event_row is not None and event_row["status"] == "confirmed"
-            )
-
-            if event_row is None:
-                self._connection.execute(
-                    """
-                    INSERT INTO entry_events (
-                        id,
-                        status,
-                        detected_at,
-                        confirmed_at,
-                        track_id,
-                        global_id,
-                        label,
-                        confirmed_photo_path,
-                        frame_number,
-                        point_x,
-                        point_y,
-                        created_at,
-                        updated_at
-                    )
-                    VALUES (?, 'confirmed', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (
-                        entry_event_id,
-                        detected_at,
-                        timestamp,
-                        track_id,
-                        global_id,
-                        row["label"],
-                        confirmed_photo_path,
-                        frame_number,
-                        point_x,
-                        point_y,
-                        now,
-                        now,
-                    ),
-                )
-            elif not already_confirmed:
-                self._connection.execute(
-                    """
-                    UPDATE entry_events
-                    SET status = 'confirmed',
-                        confirmed_at = ?,
-                        track_id = COALESCE(?, track_id),
-                        global_id = ?,
-                        label = ?,
-                        confirmed_photo_path = COALESCE(?, confirmed_photo_path),
-                        frame_number = COALESCE(frame_number, ?),
-                        point_x = COALESCE(point_x, ?),
-                        point_y = COALESCE(point_y, ?),
-                        updated_at = ?
-                    WHERE id = ?
-                    """,
-                    (
-                        timestamp,
-                        track_id,
-                        global_id,
-                        row["label"],
-                        confirmed_photo_path,
-                        frame_number,
-                        point_x,
-                        point_y,
-                        now,
-                        entry_event_id,
-                    ),
-                )
-
-            self._connection.execute(
-                """
-                INSERT INTO entered_person (
-                    id,
-                    entry_event_id,
-                    global_id,
-                    label,
-                    entered_at,
-                    track_id,
-                    created_at,
-                    updated_at
-                )
-                SELECT
-                    lower(hex(randomblob(16))),
-                    id,
-                    global_id,
-                    label,
-                    COALESCE(confirmed_at, detected_at),
-                    track_id,
-                    ?,
-                    ?
-                FROM entry_events
-                WHERE id = ?
-                    AND status = 'confirmed'
-                    AND global_id IS NOT NULL
-                ON CONFLICT(entry_event_id) DO UPDATE SET
-                    global_id = excluded.global_id,
-                    label = excluded.label,
-                    entered_at = excluded.entered_at,
-                    track_id = COALESCE(excluded.track_id, entered_person.track_id),
-                    updated_at = excluded.updated_at
-                """,
-                (now, now, entry_event_id),
-            )
-
-            if not already_confirmed:
-                self._connection.execute(
-                    """
-                    UPDATE persons
-                    SET entered = entered + 1,
-                        last_seen_at = ?,
-                        last_seen_track_id = COALESCE(?, last_seen_track_id)
-                    WHERE global_id = ?
-                    """,
-                    (timestamp, track_id, global_id),
-                )
-            updated_row = self._connection.execute(
-                "SELECT * FROM persons WHERE global_id = ?",
-                (global_id,),
-            ).fetchone()
-            event_row = self._connection.execute(
-                "SELECT * FROM entry_events WHERE id = ?",
-                (entry_event_id,),
-            ).fetchone()
-
-            if updated_row is None:
-                return None
-
-            record = self._row_to_record(updated_row)
-            record["entry_incremented"] = not already_confirmed
-            record["entry_event"] = self._entry_event_record(event_row)
-            record["total_entered"] = self.get_total_entered()
-            return record
 
     def get_total_entered(self) -> int:
         with self._lock:
@@ -757,6 +508,94 @@ class SQLiteDatabaseHandler:
                 "SELECT COUNT(*) AS total FROM entered_person"
             ).fetchone()
             return int(row["total"] if row is not None else 0)
+
+    def set_person_inside(
+        self,
+        global_id: str,
+        timestamp: int,
+        track_id: int | None = None,
+    ) -> dict[str, Any] | None:
+        """Put a known person in the current-inside set."""
+        now = int(time.time())
+        with self._lock, self._connection:
+            person_row = self._connection.execute(
+                "SELECT * FROM persons WHERE global_id = ?",
+                (global_id,),
+            ).fetchone()
+            if person_row is None:
+                return None
+
+            was_inside = (
+                self._connection.execute(
+                    "SELECT 1 FROM entered_person WHERE global_id = ?",
+                    (global_id,),
+                ).fetchone()
+                is not None
+            )
+            self._connection.execute(
+                """
+                INSERT INTO entered_person (
+                    global_id, label, entered_at, track_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(global_id) DO UPDATE SET
+                    label = excluded.label,
+                    entered_at = excluded.entered_at,
+                    track_id = excluded.track_id,
+                    updated_at = excluded.updated_at
+                """,
+                (global_id, person_row["label"], timestamp, track_id, now, now),
+            )
+            self._connection.execute(
+                """
+                UPDATE persons
+                SET last_seen_at = ?,
+                    last_seen_track_id = COALESCE(?, last_seen_track_id)
+                WHERE global_id = ?
+                """,
+                (timestamp, track_id, global_id),
+            )
+
+            updated_row = self._connection.execute(
+                "SELECT * FROM persons WHERE global_id = ?",
+                (global_id,),
+            ).fetchone()
+            if updated_row is None:
+                return None
+            record = self._row_to_record(updated_row)
+            record["entered_at"] = timestamp
+            record["inside_track_id"] = track_id
+            record["inside_added"] = not was_inside
+            record["total_entered"] = self.get_total_entered()
+            return record
+
+    def get_people_inside(self, limit: int | None = 100) -> list[dict[str, Any]]:
+        """Return the current-inside set joined with remembered people."""
+        with self._lock:
+            sql = """
+                SELECT
+                    entered_person.entered_at,
+                    entered_person.track_id AS inside_track_id,
+                    persons.*
+                FROM entered_person
+                JOIN persons ON persons.global_id = entered_person.global_id
+                ORDER BY entered_person.entered_at DESC
+            """
+            if limit is None:
+                rows = self._connection.execute(sql).fetchall()
+            else:
+                rows = self._connection.execute(
+                    sql + " LIMIT ?",
+                    (max(1, min(limit, 1000)),),
+                ).fetchall()
+            return [
+                {
+                    "entered_at": row["entered_at"],
+                    "track_id": row["inside_track_id"],
+                    "person": self._row_to_record(row),
+                }
+                for row in rows
+            ]
 
     def mark_person_exited(
         self,
@@ -766,33 +605,16 @@ class SQLiteDatabaseHandler:
     ) -> dict[str, Any] | None:
         """Remove one active entered-person link after a confirmed exit."""
         with self._lock, self._connection:
-            entered_row = self._connection.execute(
-                """
-                SELECT id, entry_event_id
-                FROM entered_person
-                WHERE global_id = ?
-                ORDER BY entered_at ASC, created_at ASC
-                LIMIT 1
-                """,
+            was_inside = self._connection.execute(
+                "SELECT 1 FROM entered_person WHERE global_id = ?",
                 (global_id,),
             ).fetchone()
-            if entered_row is None:
+            if was_inside is None:
                 return None
 
-            # Keep the historical entry event, but mark it as no longer active.
-            # Otherwise startup backfill would recreate this entered_person row.
             self._connection.execute(
-                """
-                UPDATE entry_events
-                SET status = 'exited',
-                    updated_at = ?
-                WHERE id = ?
-                """,
-                (timestamp, entered_row["entry_event_id"]),
-            )
-            self._connection.execute(
-                "DELETE FROM entered_person WHERE id = ?",
-                (entered_row["id"],),
+                "DELETE FROM entered_person WHERE global_id = ?",
+                (global_id,),
             )
             self._connection.execute(
                 """
@@ -811,134 +633,10 @@ class SQLiteDatabaseHandler:
                 return None
 
             record = self._row_to_record(person_row)
-            record["exited_entry_event_id"] = entered_row["entry_event_id"]
             record["exited_at"] = timestamp
             record["total_entered"] = self.get_total_entered()
             return record
 
-    def get_entry_events(self, limit: int | None = 100) -> list[dict[str, Any]]:
-        with self._lock:
-            if limit is None:
-                rows = self._connection.execute(
-                    """
-                    SELECT *
-                    FROM entry_events
-                    ORDER BY detected_at DESC, created_at DESC
-                    """
-                ).fetchall()
-            else:
-                limit = max(1, min(limit, 1000))
-                rows = self._connection.execute(
-                    """
-                    SELECT *
-                    FROM entry_events
-                    ORDER BY detected_at DESC, created_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-            return [
-                event
-                for event in (self._entry_event_record(row) for row in rows)
-                if event is not None
-            ]
-
-    def get_entry_event_by_id(self, entry_event_id: str) -> dict[str, Any] | None:
-        with self._lock:
-            row = self._connection.execute(
-                "SELECT * FROM entry_events WHERE id = ?",
-                (entry_event_id,),
-            ).fetchone()
-            return self._entry_event_record(row)
-
-    def get_entered_people(self, limit: int | None = 100) -> list[dict[str, Any]]:
-        """Return explicit entered_person rows with their person and entry event."""
-        with self._lock:
-            if limit is None:
-                rows = self._connection.execute(
-                    """
-                    SELECT
-                        entered_person.entry_event_id,
-                        entered_person.entered_at,
-                        entered_person.track_id AS entered_track_id,
-                        persons.id AS person_row_id,
-                        persons.*,
-                        entry_events.id AS event_id,
-                        entry_events.status AS event_status,
-                        entry_events.detected_at AS event_detected_at,
-                        entry_events.confirmed_at AS event_confirmed_at,
-                        entry_events.track_id AS event_track_id,
-                        entry_events.global_id AS event_global_id,
-                        entry_events.label AS event_label,
-                        entry_events.entry_photo_path AS event_entry_photo_path,
-                        entry_events.confirmed_photo_path AS event_confirmed_photo_path,
-                        entry_events.frame_number AS event_frame_number,
-                        entry_events.point_x AS event_point_x,
-                        entry_events.point_y AS event_point_y
-                    FROM entered_person
-                    JOIN persons ON persons.global_id = entered_person.global_id
-                    JOIN entry_events ON entry_events.id = entered_person.entry_event_id
-                    ORDER BY entered_person.entered_at DESC, entered_person.created_at DESC
-                    """
-                ).fetchall()
-            else:
-                limit = max(1, min(limit, 1000))
-                rows = self._connection.execute(
-                    """
-                    SELECT
-                        entered_person.entry_event_id,
-                        entered_person.entered_at,
-                        entered_person.track_id AS entered_track_id,
-                        persons.id AS person_row_id,
-                        persons.*,
-                        entry_events.id AS event_id,
-                        entry_events.status AS event_status,
-                        entry_events.detected_at AS event_detected_at,
-                        entry_events.confirmed_at AS event_confirmed_at,
-                        entry_events.track_id AS event_track_id,
-                        entry_events.global_id AS event_global_id,
-                        entry_events.label AS event_label,
-                        entry_events.entry_photo_path AS event_entry_photo_path,
-                        entry_events.confirmed_photo_path AS event_confirmed_photo_path,
-                        entry_events.frame_number AS event_frame_number,
-                        entry_events.point_x AS event_point_x,
-                        entry_events.point_y AS event_point_y
-                    FROM entered_person
-                    JOIN persons ON persons.global_id = entered_person.global_id
-                    JOIN entry_events ON entry_events.id = entered_person.entry_event_id
-                    ORDER BY entered_person.entered_at DESC, entered_person.created_at DESC
-                    LIMIT ?
-                    """,
-                    (limit,),
-                ).fetchall()
-
-            entered_people = []
-            for row in rows:
-                person = self._row_to_record(row)
-                event = {
-                    "id": row["event_id"],
-                    "status": row["event_status"],
-                    "detected_at": row["event_detected_at"],
-                    "confirmed_at": row["event_confirmed_at"],
-                    "track_id": row["event_track_id"],
-                    "global_id": row["event_global_id"],
-                    "label": row["event_label"],
-                    "entry_photo_path": row["event_entry_photo_path"],
-                    "confirmed_photo_path": row["event_confirmed_photo_path"],
-                    "frame_number": row["event_frame_number"],
-                    "point_x": row["event_point_x"],
-                    "point_y": row["event_point_y"],
-                }
-                entered_people.append(
-                    {
-                        "entry_event_id": row["entry_event_id"],
-                        "entered_at": row["entered_at"],
-                        "track_id": row["entered_track_id"],
-                        "person": person,
-                        "entry_event": event,
-                    }
-                )
-            return entered_people
 
     def add_visit_record(
         self,
@@ -1186,7 +884,6 @@ class SQLiteDatabaseHandler:
                     "global_id": record["global_id"],
                     "label": record["label"],
                     "visit_count": int(record["visit_count"]),
-                    "entered": int(record["entered"]),
                     "last_seen_at": record["last_seen_at"],
                     "thumbnail_name": thumbnail_path,
                     "sample_count": len(record["samples_json"] or []),
@@ -1240,7 +937,6 @@ class SQLiteDatabaseHandler:
     def clear_table(self) -> None:
         with self._lock, self._connection:
             self._connection.execute("DELETE FROM entered_person")
-            self._connection.execute("DELETE FROM entry_events")
             self._connection.execute("DELETE FROM persons")
             self._connection.execute("DELETE FROM sqlite_sequence WHERE name = 'persons'")
             self._embedding_cache.clear()

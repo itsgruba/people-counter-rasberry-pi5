@@ -156,10 +156,10 @@ class PendingIdentity:
 
 
 @dataclass
-class EntryEvent:
+class LineCrossingEvent:
     """One completed A -> B line crossing for a person track."""
 
-    entry_event_id: str
+    crossing_id: str
     track_id: int
     entered_at: int
     frame_number: int
@@ -175,7 +175,7 @@ class EntryTrackState:
     stage: str = "outside"
     crossed_a_frame: int | None = None
     crossed_a_at: int | None = None
-    entry_event_id: str | None = None
+    crossing_id: str | None = None
     entered_frame: int | None = None
     entered_at: int | None = None
     entered_global_id: str | None = None
@@ -188,8 +188,7 @@ class EntryTrackState:
 class PendingEntryContext:
     """Runtime context for an A -> B entry waiting for identity resolution."""
 
-    event: EntryEvent
-    entry_photo_path: str | None
+    event: LineCrossingEvent
     created_at: float = field(default_factory=time.time)
 
 
@@ -263,7 +262,7 @@ class EntryDetector:
         detection,
         frame_number: int,
         timestamp: int,
-    ) -> EntryEvent | None:
+    ) -> LineCrossingEvent | None:
         # The bottom-center of the person box is used as the crossing point.
         # This is more stable for doorway logic than the bbox center because it
         # follows the person's feet/ground position.
@@ -303,12 +302,12 @@ class EntryDetector:
         )
         if crossed_b and state.stage == "crossed_a" and enough_frames and crossed_a_before_b:
             state.stage = "entered"
-            state.entry_event_id = state.entry_event_id or str(uuid.uuid4())
+            state.crossing_id = state.crossing_id or str(uuid.uuid4())
             state.entered_frame = frame_number
             state.entered_at = timestamp
             state.last_point = point
-            return EntryEvent(
-                entry_event_id=state.entry_event_id,
+            return LineCrossingEvent(
+                crossing_id=state.crossing_id,
                 track_id=track_id,
                 entered_at=timestamp,
                 frame_number=frame_number,
@@ -318,32 +317,32 @@ class EntryDetector:
         state.last_point = point
         return None
 
-    def mark_entry_counted(self, track_id: int, global_id: str) -> None:
+    def mark_crossing_counted(self, track_id: int, global_id: str) -> None:
         state = self.tracks.get(track_id)
         if state is not None and state.entered_at is not None:
             state.entered_global_id = global_id
 
-    def has_uncounted_entry(self, track_id: int) -> bool:
+    def has_uncounted_crossing(self, track_id: int) -> bool:
         state = self.tracks.get(track_id)
         return (
             state is not None
             and state.entered_at is not None
-            and state.entry_event_id is not None
+            and state.crossing_id is not None
             and state.entered_global_id is None
         )
 
-    def uncounted_entry_event(self, track_id: int) -> EntryEvent | None:
+    def uncounted_crossing(self, track_id: int) -> LineCrossingEvent | None:
         state = self.tracks.get(track_id)
         if (
             state is None
-            or state.entry_event_id is None
+            or state.crossing_id is None
             or state.entered_at is None
             or state.entered_frame is None
             or state.entered_global_id is not None
         ):
             return None
-        return EntryEvent(
-            entry_event_id=state.entry_event_id,
+        return LineCrossingEvent(
+            crossing_id=state.crossing_id,
             track_id=track_id,
             entered_at=state.entered_at,
             frame_number=state.entered_frame,
@@ -673,7 +672,7 @@ class PersonFaceIdApp(GStreamerApp):
         self.last_printed_identity: dict[int, str] = {}
         self.recognition_stats = self._new_recognition_stats()
         self.entered_people: list[dict] = []
-        self.entered_people_by_entry_event_id: dict[str, dict] = {}
+        self.entered_people_by_global_id: dict[str, dict] = {}
         self.pending_entry_contexts: dict[int, PendingEntryContext] = {}
         self._load_entered_people()
         self.next_person_index = self._load_next_person_index()
@@ -1636,58 +1635,58 @@ class PersonFaceIdApp(GStreamerApp):
             )
         return photos
 
-    def _make_entered_people_item(self, person: dict, entry_event: dict) -> dict:
-        """Create one entered_people item with an explicit entry -> person link."""
+    def _make_entered_people_item(
+        self,
+        person: dict,
+        entered_at: int,
+        track_id: int | None,
+    ) -> dict:
+        """Create one item for the current-inside list."""
         return {
-            "entry_event_id": entry_event["id"],
-            "entered_at": entry_event.get("confirmed_at") or entry_event.get("detected_at"),
-            "track_id": entry_event.get("track_id"),
+            "entered_at": entered_at,
+            "track_id": track_id,
             "person_global_id": person["global_id"],
             "person_label": person["label"],
             "person": person,
             "photos": self._person_photo_refs(person),
-            "entry_event": entry_event,
         }
 
     def _remember_entered_person(
         self,
         person: dict,
-        entry_event: dict | None = None,
+        entered_at: int | None = None,
+        track_id: int | None = None,
     ) -> None:
-        """Add or refresh one confirmed entered person in memory."""
-        entry_event = entry_event or person.get("entry_event")
-        if not entry_event or not entry_event.get("id"):
-            return
-        if entry_event.get("status") != "confirmed":
-            return
-
-        item = self._make_entered_people_item(person, entry_event)
-        entry_event_id = item["entry_event_id"]
-        self.entered_people_by_entry_event_id[entry_event_id] = item
+        """Add or refresh one person in the current-inside memory list."""
+        entered_at = int(entered_at or person.get("entered_at") or time.time())
+        item = self._make_entered_people_item(person, entered_at, track_id)
+        global_id = person["global_id"]
+        self.entered_people_by_global_id[global_id] = item
 
         for index, existing_item in enumerate(self.entered_people):
-            if existing_item.get("entry_event_id") == entry_event_id:
+            if existing_item.get("person_global_id") == global_id:
                 self.entered_people[index] = item
                 return
         self.entered_people.append(item)
 
     def _load_entered_people(self) -> None:
-        """Restore confirmed entries as entered_people links from SQLite."""
+        """Restore the current-inside set from SQLite."""
         self.entered_people.clear()
-        self.entered_people_by_entry_event_id.clear()
-        for entered_person in self.db_handler.get_entered_people(limit=None):
+        self.entered_people_by_global_id.clear()
+        for entered_person in self.db_handler.get_people_inside(limit=None):
             self._remember_entered_person(
                 entered_person["person"],
-                entered_person["entry_event"],
+                entered_person["entered_at"],
+                entered_person["track_id"],
             )
 
-    def _forget_entered_person(self, entry_event_id: str) -> None:
-        """Remove one active entry from the exit camera's in-memory view."""
-        self.entered_people_by_entry_event_id.pop(entry_event_id, None)
+    def _forget_entered_person(self, global_id: str) -> None:
+        """Remove one person from the exit camera's current-inside view."""
+        self.entered_people_by_global_id.pop(global_id, None)
         self.entered_people = [
             item
             for item in self.entered_people
-            if item.get("entry_event_id") != entry_event_id
+            if item.get("person_global_id") != global_id
         ]
 
     def _record_visit_snapshot(
@@ -1735,8 +1734,6 @@ class PersonFaceIdApp(GStreamerApp):
         track_id: int,
         confidence: float,
         visit_count: int | None = None,
-        entered: int | None = None,
-        entry_event_id: str | None = None,
         total_entered: int | None = None,
     ) -> None:
         """Send a best-effort JSON event to an optional frontend/backend endpoint."""
@@ -1750,8 +1747,6 @@ class PersonFaceIdApp(GStreamerApp):
             "track_id": track_id,
             "confidence": confidence,
             "visit_count": visit_count,
-            "entered": entered,
-            "entry_event_id": entry_event_id,
             "total_entered": total_entered,
             "timestamp": int(time.time()),
         }
@@ -1807,26 +1802,13 @@ class PersonFaceIdApp(GStreamerApp):
         track_id: int,
         label: str,
         timestamp: int,
-        entry_photo_path: str | None,
     ) -> dict:
         """Create a non-searchable person row for an entry without a face embedding yet."""
-        new_person = self.db_handler.create_placeholder_record(
+        return self.db_handler.create_placeholder_record(
             timestamp=timestamp,
             label=label,
             last_seen_track_id=track_id,
         )
-        if entry_photo_path:
-            self.db_handler.add_visit_record(
-                global_id=new_person["global_id"],
-                visit_number=int(new_person["visit_count"]),
-                timestamp=timestamp,
-                photo_path=entry_photo_path,
-                track_id=track_id,
-            )
-            refreshed_person = self.db_handler.get_record_by_id(new_person["global_id"])
-            if refreshed_person is not None:
-                new_person = refreshed_person
-        return new_person
 
     def _save_known_person_sample_if_empty(
         self,
@@ -1876,7 +1858,7 @@ class PersonFaceIdApp(GStreamerApp):
     ) -> None:
         """Guarantee that a completed A -> B event lands in entered_person."""
         event = context.event
-        if not self.entry_detector.has_uncounted_entry(event.track_id):
+        if not self.entry_detector.has_uncounted_crossing(event.track_id):
             self.pending_entry_contexts.pop(event.track_id, None)
             return
 
@@ -1897,20 +1879,7 @@ class PersonFaceIdApp(GStreamerApp):
                 event.track_id,
                 label,
                 timestamp,
-                context.entry_photo_path,
             )
-
-        if created_from_samples and context.entry_photo_path:
-            self.db_handler.add_visit_record(
-                global_id=new_person["global_id"],
-                visit_number=int(new_person["visit_count"]),
-                timestamp=timestamp,
-                photo_path=context.entry_photo_path,
-                track_id=event.track_id,
-            )
-            refreshed_person = self.db_handler.get_record_by_id(new_person["global_id"])
-            if refreshed_person is not None:
-                new_person = refreshed_person
 
         self.track_to_global_id[event.track_id] = new_person["global_id"]
         self.track_to_label[event.track_id] = label
@@ -1924,8 +1893,8 @@ class PersonFaceIdApp(GStreamerApp):
             )
 
         print(
-            f"entry-created-person: entry_event_id={event.entry_event_id} "
-            f"track_id={event.track_id} global_id={new_person['global_id']} "
+            f"inside-created-person: track_id={event.track_id} "
+            f"global_id={new_person['global_id']} "
             f"label={label} reason={reason}"
         )
         self._mark_known_person_entered(
@@ -1933,7 +1902,7 @@ class PersonFaceIdApp(GStreamerApp):
             label=label,
             track_id=event.track_id,
             confidence=1.0,
-            entry_event=event,
+            crossing=event,
             person_detection=person_detection,
             frame=frame,
             width=width,
@@ -1952,7 +1921,7 @@ class PersonFaceIdApp(GStreamerApp):
 
         now = time.time()
         for track_id, context in list(self.pending_entry_contexts.items()):
-            if not self.entry_detector.has_uncounted_entry(track_id):
+            if not self.entry_detector.has_uncounted_crossing(track_id):
                 self.pending_entry_contexts.pop(track_id, None)
                 continue
 
@@ -1964,7 +1933,7 @@ class PersonFaceIdApp(GStreamerApp):
                     label=label,
                     track_id=track_id,
                     confidence=1.0,
-                    entry_event=context.event,
+                    crossing=context.event,
                     person_detection=active_person_detections.get(track_id),
                     frame=frame,
                     width=width,
@@ -1985,51 +1954,28 @@ class PersonFaceIdApp(GStreamerApp):
                 height=height,
             )
 
-    def _handle_entry_event(
+    def _handle_entry_crossing(
         self,
-        event: EntryEvent,
+        event: LineCrossingEvent,
         person_detection,
         frame: np.ndarray | None,
         width: int | None,
         height: int | None,
     ) -> None:
-        entry_photo_path = self._save_entry_snapshot(
-            entry_event_id=event.entry_event_id,
-            kind="entry",
-            timestamp=event.entered_at,
-            track_id=event.track_id,
-            frame=frame,
-            detection=person_detection,
-            width=width,
-            height=height,
-        )
-        pending_event = self.db_handler.register_entry_pending(
-            entry_event_id=event.entry_event_id,
-            timestamp=event.entered_at,
-            track_id=event.track_id,
-            frame_number=event.frame_number,
-            point=event.point,
-            entry_photo_path=entry_photo_path,
-        )
         label = self.track_to_label.get(event.track_id, "Unknown")
         global_id = self.track_to_global_id.get(event.track_id)
         if global_id is None:
             self.pending_entry_contexts[event.track_id] = PendingEntryContext(
                 event=event,
-                entry_photo_path=entry_photo_path,
             )
-            print(
-                f"entered-pending: entry_event_id={event.entry_event_id} "
-                f"track_id={event.track_id} label=Unknown"
-            )
+            print(f"inside-pending: track_id={event.track_id} label=Unknown")
             self._notify_frontend(
-                "entered_pending",
+                "inside_pending",
                 None,
                 "Unknown",
                 event.track_id,
                 0.0,
-                entry_event_id=event.entry_event_id,
-                total_entered=pending_event.get("total_entered"),
+                total_entered=self.db_handler.get_total_entered(),
             )
             if self.entry_pending_resolution_seconds == 0:
                 self._resolve_pending_entry_as_new_person(
@@ -2047,7 +1993,7 @@ class PersonFaceIdApp(GStreamerApp):
             label=label,
             track_id=event.track_id,
             confidence=1.0,
-            entry_event=event,
+            crossing=event,
             person_detection=person_detection,
             frame=frame,
             width=width,
@@ -2060,54 +2006,35 @@ class PersonFaceIdApp(GStreamerApp):
         label: str,
         track_id: int,
         confidence: float,
-        entry_event: EntryEvent,
+        crossing: LineCrossingEvent,
         person_detection=None,
         frame: np.ndarray | None = None,
         width: int | None = None,
         height: int | None = None,
     ) -> None:
         timestamp = int(time.time())
-        confirmed_photo_path = self._save_entry_snapshot(
-            entry_event_id=entry_event.entry_event_id,
-            kind="confirmed",
-            timestamp=timestamp,
-            track_id=track_id,
-            frame=frame,
-            detection=person_detection,
-            width=width,
-            height=height,
-        )
-        record = self.db_handler.mark_person_entered(
+        record = self.db_handler.set_person_inside(
             global_id=global_id,
             timestamp=timestamp,
             track_id=track_id,
-            entry_event_id=entry_event.entry_event_id,
-            detected_at=entry_event.entered_at,
-            frame_number=entry_event.frame_number,
-            point=entry_event.point,
-            confirmed_photo_path=confirmed_photo_path,
         )
         if record is None:
             return
 
-        self.entry_detector.mark_entry_counted(track_id, global_id)
+        self.entry_detector.mark_crossing_counted(track_id, global_id)
         self.pending_entry_contexts.pop(track_id, None)
-        self._remember_entered_person(record)
-        entered = int(record.get("entered", 0))
+        self._remember_entered_person(record, timestamp, track_id)
         total_entered = int(record.get("total_entered", 0))
         print(
-            f"entered: entry_event_id={entry_event.entry_event_id} "
-            f"track_id={track_id} global_id={global_id} "
-            f"label={label} entered={entered} total_entered={total_entered}"
+            f"inside: track_id={track_id} global_id={global_id} "
+            f"label={label} total_entered={total_entered}"
         )
         self._notify_frontend(
-            "entered",
+            "inside",
             global_id,
             label,
             track_id,
             confidence,
-            entered=entered,
-            entry_event_id=entry_event.entry_event_id,
             total_entered=total_entered,
         )
 
@@ -2122,15 +2049,15 @@ class PersonFaceIdApp(GStreamerApp):
         width: int | None = None,
         height: int | None = None,
     ) -> None:
-        entry_event = self.entry_detector.uncounted_entry_event(track_id)
-        if entry_event is None:
+        crossing = self.entry_detector.uncounted_crossing(track_id)
+        if crossing is None:
             return
         self._mark_known_person_entered(
             global_id=global_id,
             label=label,
             track_id=track_id,
             confidence=confidence,
-            entry_event=entry_event,
+            crossing=crossing,
             person_detection=person_detection,
             frame=frame,
             width=width,
@@ -2143,7 +2070,7 @@ class PersonFaceIdApp(GStreamerApp):
         label: str,
         track_id: int,
         confidence: float,
-        exit_event: EntryEvent,
+        exit_event: LineCrossingEvent,
     ) -> None:
         record = self.db_handler.mark_person_exited(
             global_id=global_id,
@@ -2152,7 +2079,7 @@ class PersonFaceIdApp(GStreamerApp):
         )
         # Mark this physical crossing as handled even if another process already
         # removed the active row, so one track cannot repeatedly emit an exit.
-        self.exit_detector.mark_entry_counted(track_id, global_id)
+        self.exit_detector.mark_crossing_counted(track_id, global_id)
         if record is None:
             logger.warning(
                 "Exit crossed but no active entered_person row exists: "
@@ -2162,30 +2089,27 @@ class PersonFaceIdApp(GStreamerApp):
             )
             return
 
-        exited_entry_event_id = record["exited_entry_event_id"]
-        self._forget_entered_person(exited_entry_event_id)
+        self._forget_entered_person(global_id)
         total_entered = int(record["total_entered"])
         print(
-            f"exited: exit_event_id={exit_event.entry_event_id} "
-            f"entry_event_id={exited_entry_event_id} track_id={track_id} "
-            f"global_id={global_id} label={label} total_entered={total_entered}"
+            f"outside: track_id={track_id} global_id={global_id} "
+            f"label={label} total_entered={total_entered}"
         )
         self._notify_frontend(
-            "exited",
+            "outside",
             global_id,
             label,
             track_id,
             confidence,
-            entry_event_id=exited_entry_event_id,
             total_entered=total_entered,
         )
 
-    def _handle_exit_event(self, event: EntryEvent) -> None:
+    def _handle_exit_event(self, event: LineCrossingEvent) -> None:
         global_id = self.track_to_global_id.get(event.track_id)
         if global_id is None:
             logger.info(
-                "Exit A -> B is waiting for identity: exit_event_id=%s track_id=%d",
-                event.entry_event_id,
+                "Exit A -> B is waiting for identity: crossing_id=%s track_id=%d",
+                event.crossing_id,
                 event.track_id,
             )
             return
@@ -2204,7 +2128,7 @@ class PersonFaceIdApp(GStreamerApp):
         label: str,
         confidence: float,
     ) -> None:
-        exit_event = self.exit_detector.uncounted_entry_event(track_id)
+        exit_event = self.exit_detector.uncounted_crossing(track_id)
         if exit_event is None:
             return
         self._mark_known_person_exited(
@@ -2790,9 +2714,6 @@ class PersonFaceIdApp(GStreamerApp):
     def _visit_sample_dir(self, label: str, visit_number: int) -> Path:
         return self._person_sample_dir(label) / "visit_count" / f"visit_{visit_number}"
 
-    def _entry_event_sample_dir(self, entry_event_id: str) -> Path:
-        return self.samples_dir / "_entries" / entry_event_id
-
     def _cleanup_empty_sample_dirs(self, start_dir: Path) -> None:
         try:
             current = start_dir.resolve()
@@ -2858,29 +2779,6 @@ class PersonFaceIdApp(GStreamerApp):
         visit_dir = self._visit_sample_dir(label, visit_number)
         visit_dir.mkdir(parents=True, exist_ok=True)
         image_path = visit_dir / f"snapshot_{timestamp}_track_{track_id}.jpeg"
-        cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
-        if cropped.size == 0:
-            cropped = frame
-        self.save_image_file(cropped, str(image_path))
-        return str(image_path)
-
-    def _save_entry_snapshot(
-        self,
-        entry_event_id: str,
-        kind: str,
-        timestamp: int,
-        track_id: int,
-        frame: np.ndarray | None,
-        detection,
-        width: int | None,
-        height: int | None,
-    ) -> str | None:
-        if frame is None or detection is None or width is None or height is None:
-            return None
-
-        entry_dir = self._entry_event_sample_dir(entry_event_id)
-        entry_dir.mkdir(parents=True, exist_ok=True)
-        image_path = entry_dir / f"{kind}_{timestamp}_track_{track_id}.jpeg"
         cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
         if cropped.size == 0:
             cropped = frame
@@ -3436,7 +3334,7 @@ class PersonFaceIdApp(GStreamerApp):
                 timestamp=timestamp,
             )
             if event is not None:
-                self._handle_entry_event(event, person_detection, frame, width, height)
+                self._handle_entry_crossing(event, person_detection, frame, width, height)
 
         self._resolve_stale_pending_entries(active_person_detections, frame, width, height)
         self.entry_detector.cleanup(active_track_ids)
