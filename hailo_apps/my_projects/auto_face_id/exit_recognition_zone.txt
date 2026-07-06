@@ -2,10 +2,10 @@
 # 0,0 is top-left; 1,1 is bottom-right.
 # Recognition remains disabled for an unbound track until its selected anchor
 # enters this polygon. Edit while running with --exit-recognition-zone-file.
-0.20,0.45,0.80,0.45,0.80,0.95,0.20,0.95
+0.01,0.5,0.3,0.5,0.75,0.95,0.08,0.95
 
 # Exit is confirmed when one person track crosses A and then B.
 # Swap the values if people move upward in the exit-camera image.
-exit_line_a_y=0.55
-exit_line_b_y=0.75
+exit_line_a_y=0.65
+exit_line_b_y=0.9
 exit_line_margin=0.02

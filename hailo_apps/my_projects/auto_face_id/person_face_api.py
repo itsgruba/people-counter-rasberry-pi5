@@ -82,8 +82,7 @@ class EnteredPersonCard(PersonCard):
 
 class EnteredPeopleResponse(BaseModel):
     entered_people: list[EnteredPersonCard]
-    total_entered: int = Field(..., examples=[12])
-    count: int = Field(..., examples=[1])
+    total_inside: int = Field(..., examples=[12])
 
 
 class SampleRef(BaseModel):
@@ -192,8 +191,7 @@ ENTERED_PEOPLE_EXAMPLE = {
             ],
         }
     ],
-    "total_entered": 12,
-    "count": 1,
+    "total_inside": 12,
 }
 PERSON_EXAMPLE = {
     "person": {
@@ -289,7 +287,7 @@ def _sample_url(sample_path: str | None) -> str | None:
     return "/samples/" + "/".join(quote(part) for part in safe_parts)
 
 
-def _absolute_url(request: Request, path: str | None) -> str | None:
+def _absolute_url(request: Request | WebSocket, path: str | None) -> str | None:
     if not path:
         return None
     return str(request.base_url).rstrip("/") + path
@@ -302,11 +300,17 @@ def _sample_name(sample_path: str | None) -> str | None:
     return sample_url.removeprefix("/samples/")
 
 
-def _sample_absolute_url(request: Request, sample_path: str | None) -> str | None:
+def _sample_absolute_url(
+    request: Request | WebSocket,
+    sample_path: str | None,
+) -> str | None:
     return _absolute_url(request, _sample_url(sample_path))
 
 
-def _person_card_response(person: dict[str, Any], request: Request) -> dict[str, Any]:
+def _person_card_response(
+    person: dict[str, Any],
+    request: Request | WebSocket,
+) -> dict[str, Any]:
     thumbnail_name = None
     thumbnail_url = None
     samples = person.get("samples_json") or []
@@ -326,7 +330,10 @@ def _person_card_response(person: dict[str, Any], request: Request) -> dict[str,
     }
 
 
-def _person_photo_refs(person: dict[str, Any], request: Request) -> list[dict[str, Any]]:
+def _person_photo_refs(
+    person: dict[str, Any],
+    request: Request | WebSocket,
+) -> list[dict[str, Any]]:
     photos = []
     for sample in person.get("samples_json") or []:
         sample_path = sample.get("sample_path")
@@ -365,7 +372,7 @@ def _person_photo_refs(person: dict[str, Any], request: Request) -> list[dict[st
 def _entered_person_response(
     entered_person: dict[str, Any],
     person: dict[str, Any],
-    request: Request,
+    request: Request | WebSocket,
 ) -> dict[str, Any]:
     card = _person_card_response(person, request)
     card.update(
@@ -376,6 +383,29 @@ def _entered_person_response(
         }
     )
     return card
+
+
+def _state_snapshot(
+    db: SQLiteDatabaseHandler,
+    request: Request | WebSocket,
+) -> dict[str, Any]:
+    """Build the complete people/inside state sent to HTTP and WebSocket clients."""
+    people = db.get_people_cards()
+    for person in people:
+        person["thumbnail_url"] = _absolute_url(
+            request,
+            _sample_url(person.get("thumbnail_name")),
+        )
+
+    entered_people = [
+        _entered_person_response(row, row["person"], request)
+        for row in db.get_people_inside(limit=None)
+    ]
+    return {
+        "people": people,
+        "entered_people": entered_people,
+        "total_entered": db.get_total_entered(),
+    }
 
 
 class WebSocketManager:
@@ -455,12 +485,7 @@ def health() -> HealthResponse:
 )
 def list_people(request: Request) -> PeopleResponse:
     db = _db(request)
-    people = db.get_people_cards()
-    for person in people:
-        person["thumbnail_url"] = _absolute_url(
-            request,
-            _sample_url(person.get("thumbnail_name")),
-        )
+    people = _state_snapshot(db, request)["people"]
     return {"people": people, "count": len(people)}
 
 
@@ -471,16 +496,14 @@ def list_people(request: Request) -> PeopleResponse:
 )
 def list_entered_people(request: Request, limit: int = 100) -> EnteredPeopleResponse:
     db = _db(request)
-    entry_limit = None if limit <= 0 else limit
-    entered_people = [
-        _entered_person_response(row, row["person"], request)
-        for row in db.get_people_inside(limit=entry_limit)
-    ]
+    state = _state_snapshot(db, request)
+    entered_people = state["entered_people"]
+    if limit > 0:
+        entered_people = entered_people[:limit]
 
     return {
         "entered_people": entered_people,
-        "total_entered": db.get_total_entered(),
-        "count": len(entered_people),
+        "total_inside": state["total_entered"],
     }
 
 
@@ -588,7 +611,11 @@ def get_sample(sample_path: str) -> FileResponse:
 async def receive_event(payload: EventPayload, request: Request) -> EventAck:
     logger.info("Event received: %s", payload)
     data = payload.model_dump()
-    data["total_entered"] = _db(request).get_total_entered()
+    db = _db(request)
+    if payload.event in {"inside", "outside"}:
+        data.update(_state_snapshot(db, request))
+    else:
+        data["total_entered"] = db.get_total_entered()
     await _ws_manager(request).broadcast(
         {
             "type": payload.event,
@@ -605,19 +632,7 @@ async def websocket_endpoint(websocket: WebSocket) -> None:
         await websocket.send_json(
             {
                 "type": "init",
-                "data": {
-                    "people": websocket.app.state.db.get_people_cards(),
-                    "total_entered": websocket.app.state.db.get_total_entered(),
-                    "entered_people": [
-                        {
-                            "global_id": row["person"]["global_id"],
-                            "label": row["person"]["label"],
-                            "entered_at": row["entered_at"],
-                            "track_id": row["track_id"],
-                        }
-                        for row in websocket.app.state.db.get_people_inside(limit=None)
-                    ],
-                },
+                "data": _state_snapshot(websocket.app.state.db, websocket),
             }
         )
         while True:
