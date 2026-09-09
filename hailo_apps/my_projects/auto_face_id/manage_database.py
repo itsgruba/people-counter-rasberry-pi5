@@ -40,6 +40,7 @@ def _print_summary(db: SQLiteDatabaseHandler) -> None:
             f"- {record['label']}: global_id={record['global_id']} "
             f"samples={len(record['samples_json'])} "
             f"visits={len(record.get('visits_json') or [])} "
+            f"visit_events={len(record.get('visit_events_json') or [])} "
             f"entered={record.get('entered', 0)}"
         )
 
@@ -69,6 +70,10 @@ def _sample_files_in_use(db: SQLiteDatabaseHandler) -> set[Path]:
                 files.add(Path(sample_path).resolve())
         for visit in record.get("visits_json") or []:
             photo_path = visit.get("photo_path")
+            if photo_path:
+                files.add(Path(photo_path).resolve())
+        for visit_event in record.get("visit_events_json") or []:
+            photo_path = visit_event.get("photo_path")
             if photo_path:
                 files.add(Path(photo_path).resolve())
     return files

@@ -44,6 +44,7 @@ def main() -> None:
             f"- {record['label']}: global_id={record['global_id']} "
             f"samples={len(record['samples_json'])} "
             f"visits={len(record.get('visits_json') or [])} "
+            f"visit_events={len(record.get('visit_events_json') or [])} "
             f"entered={record.get('entered', 0)}"
         )
 

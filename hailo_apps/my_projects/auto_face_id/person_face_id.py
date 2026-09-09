@@ -655,7 +655,7 @@ class PersonFaceIdApp(GStreamerApp):
             "output-format-type=HAILO_FORMAT_TYPE_FLOAT32"
         )
 
-        # Database handler owns persistent people, samples, visits, and entry events.
+        # Database handler owns persistent people, samples, visits, and movement events.
         self.db_handler = SQLiteDatabaseHandler(
             db_name=DB_NAME,
             threshold=0.55,
@@ -1633,6 +1633,20 @@ class PersonFaceIdApp(GStreamerApp):
                     "track_id": visit.get("track_id"),
                 }
             )
+        for visit_event in person.get("visit_events_json") or []:
+            photo_path = visit_event.get("photo_path")
+            if not photo_path:
+                continue
+            photos.append(
+                {
+                    "kind": visit_event.get("event_type", "visit_event"),
+                    "id": visit_event.get("id"),
+                    "path": photo_path,
+                    "timestamp": visit_event.get("timestamp"),
+                    "visit_number": visit_event.get("visit_number"),
+                    "track_id": visit_event.get("track_id"),
+                }
+            )
         return photos
 
     def _make_entered_people_item(
@@ -1725,6 +1739,64 @@ class PersonFaceIdApp(GStreamerApp):
             photo_path=image_path,
             track_id=track_id,
         )
+        self.db_handler.add_visit_event(
+            global_id=person["global_id"],
+            event_type="entry",
+            visit_number=visit_number,
+            timestamp=timestamp,
+            photo_path=image_path,
+            track_id=track_id,
+        )
+
+    def _record_visit_event_snapshot(
+        self,
+        person: dict,
+        event_type: str,
+        timestamp: int,
+        track_id: int,
+        frame: np.ndarray | None,
+        person_detection,
+        width: int | None,
+        height: int | None,
+        record_legacy_visit: bool = False,
+    ) -> None:
+        """Save one entry/exit photo and link it to the person."""
+        if frame is None or person_detection is None or width is None or height is None:
+            logger.warning(
+                "%s event for %s had no frame available for a snapshot.",
+                event_type,
+                person.get("label", person.get("global_id")),
+            )
+            return
+
+        visit_number = max(1, int(person.get("visit_count") or 1))
+        image_path = self._save_visit_event_snapshot(
+            label=person["label"],
+            visit_number=visit_number,
+            event_type=event_type,
+            timestamp=timestamp,
+            track_id=track_id,
+            frame=frame,
+            detection=person_detection,
+            width=width,
+            height=height,
+        )
+        self.db_handler.add_visit_event(
+            global_id=person["global_id"],
+            event_type=event_type,
+            visit_number=visit_number,
+            timestamp=timestamp,
+            photo_path=image_path,
+            track_id=track_id,
+        )
+        if record_legacy_visit and event_type == "entry":
+            self.db_handler.add_visit_record(
+                global_id=person["global_id"],
+                visit_number=visit_number,
+                timestamp=timestamp,
+                photo_path=image_path,
+                track_id=track_id,
+            )
 
     def _notify_frontend(
         self,
@@ -2012,7 +2084,7 @@ class PersonFaceIdApp(GStreamerApp):
         width: int | None = None,
         height: int | None = None,
     ) -> None:
-        timestamp = int(time.time())
+        timestamp = crossing.entered_at
         record = self.db_handler.set_person_inside(
             global_id=global_id,
             timestamp=timestamp,
@@ -2023,6 +2095,17 @@ class PersonFaceIdApp(GStreamerApp):
 
         self.entry_detector.mark_crossing_counted(track_id, global_id)
         self.pending_entry_contexts.pop(track_id, None)
+        self._record_visit_event_snapshot(
+            person=record,
+            event_type="entry",
+            timestamp=timestamp,
+            track_id=track_id,
+            frame=frame,
+            person_detection=person_detection,
+            width=width,
+            height=height,
+            record_legacy_visit=True,
+        )
         self._remember_entered_person(record, timestamp, track_id)
         total_entered = int(record.get("total_entered", 0))
         print(
@@ -2071,6 +2154,10 @@ class PersonFaceIdApp(GStreamerApp):
         track_id: int,
         confidence: float,
         exit_event: LineCrossingEvent,
+        person_detection=None,
+        frame: np.ndarray | None = None,
+        width: int | None = None,
+        height: int | None = None,
     ) -> None:
         record = self.db_handler.mark_person_exited(
             global_id=global_id,
@@ -2089,6 +2176,16 @@ class PersonFaceIdApp(GStreamerApp):
             )
             return
 
+        self._record_visit_event_snapshot(
+            person=record,
+            event_type="exit",
+            timestamp=exit_event.entered_at,
+            track_id=track_id,
+            frame=frame,
+            person_detection=person_detection,
+            width=width,
+            height=height,
+        )
         self._forget_entered_person(global_id)
         total_entered = int(record["total_entered"])
         print(
@@ -2104,7 +2201,14 @@ class PersonFaceIdApp(GStreamerApp):
             total_entered=total_entered,
         )
 
-    def _handle_exit_event(self, event: LineCrossingEvent) -> None:
+    def _handle_exit_event(
+        self,
+        event: LineCrossingEvent,
+        person_detection,
+        frame: np.ndarray | None,
+        width: int | None,
+        height: int | None,
+    ) -> None:
         global_id = self.track_to_global_id.get(event.track_id)
         if global_id is None:
             logger.info(
@@ -2119,6 +2223,10 @@ class PersonFaceIdApp(GStreamerApp):
             track_id=event.track_id,
             confidence=1.0,
             exit_event=event,
+            person_detection=person_detection,
+            frame=frame,
+            width=width,
+            height=height,
         )
 
     def _apply_pending_exit_for_track(
@@ -2127,6 +2235,10 @@ class PersonFaceIdApp(GStreamerApp):
         global_id: str,
         label: str,
         confidence: float,
+        person_detection=None,
+        frame: np.ndarray | None = None,
+        width: int | None = None,
+        height: int | None = None,
     ) -> None:
         exit_event = self.exit_detector.uncounted_crossing(track_id)
         if exit_event is None:
@@ -2137,6 +2249,10 @@ class PersonFaceIdApp(GStreamerApp):
             track_id=track_id,
             confidence=confidence,
             exit_event=exit_event,
+            person_detection=person_detection,
+            frame=frame,
+            width=width,
+            height=height,
         )
 
     # ------------------------------------------------------------------
@@ -2714,6 +2830,19 @@ class PersonFaceIdApp(GStreamerApp):
     def _visit_sample_dir(self, label: str, visit_number: int) -> Path:
         return self._person_sample_dir(label) / "visit_count" / f"visit_{visit_number}"
 
+    def _visit_event_sample_dir(
+        self,
+        label: str,
+        visit_number: int,
+        event_type: str,
+    ) -> Path:
+        return (
+            self._person_sample_dir(label)
+            / "visit_events"
+            / f"visit_{visit_number}"
+            / event_type
+        )
+
     def _cleanup_empty_sample_dirs(self, start_dir: Path) -> None:
         try:
             current = start_dir.resolve()
@@ -2777,6 +2906,27 @@ class PersonFaceIdApp(GStreamerApp):
         height: int,
     ) -> str:
         visit_dir = self._visit_sample_dir(label, visit_number)
+        visit_dir.mkdir(parents=True, exist_ok=True)
+        image_path = visit_dir / f"snapshot_{timestamp}_track_{track_id}.jpeg"
+        cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
+        if cropped.size == 0:
+            cropped = frame
+        self.save_image_file(cropped, str(image_path))
+        return str(image_path)
+
+    def _save_visit_event_snapshot(
+        self,
+        label: str,
+        visit_number: int,
+        event_type: str,
+        timestamp: int,
+        track_id: int,
+        frame: np.ndarray,
+        detection,
+        width: int,
+        height: int,
+    ) -> str:
+        visit_dir = self._visit_event_sample_dir(label, visit_number, event_type)
         visit_dir.mkdir(parents=True, exist_ok=True)
         image_path = visit_dir / f"snapshot_{timestamp}_track_{track_id}.jpeg"
         cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
@@ -2932,7 +3082,11 @@ class PersonFaceIdApp(GStreamerApp):
             width=width,
             height=height,
         )
-        if updated_record and updated_record.get("visit_incremented"):
+        if (
+            updated_record
+            and updated_record.get("visit_incremented")
+            and not self.entry_counter_enabled
+        ):
             self._record_visit_snapshot(
                 updated_record,
                 track_id,
@@ -2956,6 +3110,9 @@ class PersonFaceIdApp(GStreamerApp):
         person: dict,
         confidence: float,
         person_detection,
+        frame: np.ndarray | None,
+        width: int | None,
+        height: int | None,
     ) -> None:
         """Bind an exit-camera track to the closest already-entered person."""
         self.track_to_global_id[track_id] = person["global_id"]
@@ -2979,6 +3136,10 @@ class PersonFaceIdApp(GStreamerApp):
             person["global_id"],
             person["label"],
             confidence,
+            person_detection=person_detection,
+            frame=frame,
+            width=width,
+            height=height,
         )
 
     def _bind_existing_person_from_vote(
@@ -3201,14 +3362,15 @@ class PersonFaceIdApp(GStreamerApp):
             width=width,
             height=height,
         )
-        self._record_visit_snapshot(
-            new_person,
-            track_id,
-            frame,
-            person_detection,
-            width,
-            height,
-        )
+        if not self.entry_counter_enabled:
+            self._record_visit_snapshot(
+                new_person,
+                track_id,
+                frame,
+                person_detection,
+                width,
+                height,
+            )
         self._notify_frontend(
             "enrolled",
             new_person["global_id"],
@@ -3339,7 +3501,14 @@ class PersonFaceIdApp(GStreamerApp):
         self._resolve_stale_pending_entries(active_person_detections, frame, width, height)
         self.entry_detector.cleanup(active_track_ids)
 
-    def _update_exit_counter(self, person_detections, frame_number: int) -> None:
+    def _update_exit_counter(
+        self,
+        person_detections,
+        frame_number: int,
+        frame: np.ndarray | None,
+        width: int | None,
+        height: int | None,
+    ) -> None:
         if not self.exit_counter_enabled:
             return
 
@@ -3357,7 +3526,7 @@ class PersonFaceIdApp(GStreamerApp):
                 timestamp=timestamp,
             )
             if event is not None:
-                self._handle_exit_event(event)
+                self._handle_exit_event(event, person_detection, frame, width, height)
 
         self.exit_detector.cleanup(active_track_ids)
 
@@ -3500,6 +3669,7 @@ class PersonFaceIdApp(GStreamerApp):
             self.debug_face_overlay
             or self.debug_stream_enabled
             or self.entry_counter_enabled
+            or self.exit_counter_enabled
         )
         frame = (
             get_numpy_from_buffer_efficient(buffer, fmt, width, height)
@@ -3507,7 +3677,7 @@ class PersonFaceIdApp(GStreamerApp):
             else None
         )
         self._update_entry_counter(person_detections, frame_number, frame, width, height)
-        self._update_exit_counter(person_detections, frame_number)
+        self._update_exit_counter(person_detections, frame_number, frame, width, height)
         needs_debug_frame = self.debug_face_overlay or self.debug_stream_enabled
 
         # Recognition flow per face:
@@ -3619,6 +3789,9 @@ class PersonFaceIdApp(GStreamerApp):
                     person,
                     confidence,
                     matched_person,
+                    frame,
+                    width,
+                    height,
                 )
                 stats["known"] += 1
                 continue

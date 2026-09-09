@@ -63,6 +63,7 @@ class PeopleResponse(BaseModel):
 
 class PersonPhotoRef(BaseModel):
     kind: str = Field(..., examples=["face_sample"])
+    event_type: str | None = Field(default=None, examples=["entry"])
     id: str | None = Field(default=None, examples=["sample-1"])
     timestamp: int | None = Field(default=None, examples=[1717500000])
     photo_name: str | None = Field(default=None, examples=["person_1/abc123.jpeg"])
@@ -107,6 +108,35 @@ class VisitRef(BaseModel):
     )
 
 
+class VisitEventRef(BaseModel):
+    id: str | None = Field(default=None, examples=["event-1"])
+    event_type: str = Field(..., examples=["entry"])
+    visit_number: int = Field(..., examples=[1])
+    timestamp: int | None = Field(default=None, examples=[1717500000])
+    track_id: int | None = Field(default=None, examples=[12])
+    photo_name: str | None = Field(
+        default=None,
+        examples=["person_1/visit_events/visit_1/entry/snapshot.jpeg"],
+    )
+    photo_url: str | None = Field(
+        default=None,
+        examples=[
+            "http://127.0.0.1:8000/samples/person_1/visit_events/visit_1/entry/"
+            "snapshot.jpeg"
+        ],
+    )
+
+
+class VisitEventCard(VisitEventRef):
+    global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
+    label: str = Field(..., examples=["person_1"])
+
+
+class VisitEventsResponse(BaseModel):
+    visit_events: list[VisitEventCard]
+    count: int = Field(..., examples=[2])
+
+
 class PersonDetails(BaseModel):
     global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
     label: str = Field(..., examples=["person_1"])
@@ -115,6 +145,7 @@ class PersonDetails(BaseModel):
     last_seen_track_id: int | None = Field(default=None, examples=[12])
     samples: list[SampleRef]
     visits: list[VisitRef]
+    visit_events: list[VisitEventRef]
 
 
 class PersonResponse(BaseModel):
@@ -181,6 +212,7 @@ ENTERED_PEOPLE_EXAMPLE = {
             "photos": [
                 {
                     "kind": "face_sample",
+                    "event_type": None,
                     "id": "sample-1",
                     "timestamp": 1717500000,
                     "photo_name": "person_1/abc123.jpeg",
@@ -219,7 +251,46 @@ PERSON_EXAMPLE = {
                 ),
             }
         ],
+        "visit_events": [
+            {
+                "id": "event-1",
+                "event_type": "entry",
+                "visit_number": 1,
+                "timestamp": 1717500000,
+                "track_id": 12,
+                "photo_name": (
+                    "person_1/visit_events/visit_1/entry/"
+                    "snapshot_1717500000_track_12.jpeg"
+                ),
+                "photo_url": (
+                    "http://127.0.0.1:8000/samples/person_1/visit_events/visit_1/"
+                    "entry/snapshot_1717500000_track_12.jpeg"
+                ),
+            }
+        ],
     }
+}
+VISIT_EVENTS_EXAMPLE = {
+    "visit_events": [
+        {
+            "id": "event-2",
+            "event_type": "exit",
+            "visit_number": 1,
+            "timestamp": 1717500300,
+            "track_id": 21,
+            "photo_name": (
+                "person_1/visit_events/visit_1/exit/"
+                "snapshot_1717500300_track_21.jpeg"
+            ),
+            "photo_url": (
+                "http://127.0.0.1:8000/samples/person_1/visit_events/visit_1/"
+                "exit/snapshot_1717500300_track_21.jpeg"
+            ),
+            "global_id": "3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1",
+            "label": "person_1",
+        }
+    ],
+    "count": 1,
 }
 EVENT_EXAMPLE = {
     "event": "recognized",
@@ -342,6 +413,7 @@ def _person_photo_refs(
         photos.append(
             {
                 "kind": "face_sample",
+                "event_type": None,
                 "id": sample.get("id"),
                 "timestamp": sample.get("timestamp"),
                 "photo_name": _sample_name(sample_path),
@@ -358,6 +430,7 @@ def _person_photo_refs(
         photos.append(
             {
                 "kind": "visit",
+                "event_type": None,
                 "id": visit.get("id"),
                 "timestamp": visit.get("timestamp"),
                 "photo_name": _sample_name(photo_path),
@@ -366,7 +439,45 @@ def _person_photo_refs(
                 "track_id": visit.get("track_id"),
             }
         )
+    for visit_event in person.get("visit_events_json") or []:
+        photo_path = visit_event.get("photo_path")
+        if not photo_path:
+            continue
+        event_type = visit_event.get("event_type")
+        photos.append(
+            {
+                "kind": event_type or "visit_event",
+                "event_type": event_type,
+                "id": visit_event.get("id"),
+                "timestamp": visit_event.get("timestamp"),
+                "photo_name": _sample_name(photo_path),
+                "photo_url": _sample_absolute_url(request, photo_path),
+                "visit_number": visit_event.get("visit_number"),
+                "track_id": visit_event.get("track_id"),
+            }
+        )
     return photos
+
+
+def _visit_event_response(
+    visit_event: dict[str, Any],
+    request: Request | WebSocket,
+) -> dict[str, Any]:
+    photo_path = visit_event.get("photo_path")
+    response = {
+        "id": visit_event.get("id"),
+        "event_type": visit_event["event_type"],
+        "visit_number": visit_event["visit_number"],
+        "timestamp": visit_event.get("timestamp"),
+        "track_id": visit_event.get("track_id"),
+        "photo_name": _sample_name(photo_path),
+        "photo_url": _sample_absolute_url(request, photo_path),
+    }
+    if "global_id" in visit_event:
+        response["global_id"] = visit_event["global_id"]
+    if "label" in visit_event:
+        response["label"] = visit_event["label"]
+    return response
 
 
 def _entered_person_response(
@@ -401,9 +512,14 @@ def _state_snapshot(
         _entered_person_response(row, row["person"], request)
         for row in db.get_people_inside(limit=None)
     ]
+    visit_events = [
+        _visit_event_response(visit_event, request)
+        for visit_event in db.get_visit_events(limit=None)
+    ]
     return {
         "people": people,
         "entered_people": entered_people,
+        "visit_events": visit_events,
         "total_entered": db.get_total_entered(),
     }
 
@@ -446,7 +562,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Person Face API",
     version="1.0.0",
-    description="Backend for listing people, sample images, and visit counters.",
+    description="Backend for listing people, sample images, visit counters, and entry/exit events.",
     lifespan=lifespan,
 )
 
@@ -508,6 +624,20 @@ def list_entered_people(request: Request, limit: int = 100) -> EnteredPeopleResp
 
 
 @app.get(
+    "/api/visit-events",
+    response_model=VisitEventsResponse,
+    responses={200: {"content": {"application/json": {"example": VISIT_EVENTS_EXAMPLE}}}},
+)
+def list_visit_events(request: Request, limit: int = 100) -> VisitEventsResponse:
+    db = _db(request)
+    visit_events = [
+        _visit_event_response(visit_event, request)
+        for visit_event in db.get_visit_events(limit=limit if limit > 0 else None)
+    ]
+    return {"visit_events": visit_events, "count": len(visit_events)}
+
+
+@app.get(
     "/api/people/{global_id}",
     response_model=PersonResponse,
     responses={200: {"content": {"application/json": {"example": PERSON_EXAMPLE}}}},
@@ -540,6 +670,11 @@ def get_person(global_id: str, request: Request) -> PersonResponse:
             }
         )
 
+    visit_events = [
+        _visit_event_response(visit_event, request)
+        for visit_event in person.get("visit_events_json") or []
+    ]
+
     return {
         "person": {
             "global_id": person["global_id"],
@@ -549,6 +684,7 @@ def get_person(global_id: str, request: Request) -> PersonResponse:
             "last_seen_track_id": person.get("last_seen_track_id"),
             "samples": samples,
             "visits": visits,
+            "visit_events": visit_events,
         }
     }
 

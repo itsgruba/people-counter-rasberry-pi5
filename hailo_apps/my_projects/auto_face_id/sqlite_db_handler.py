@@ -43,6 +43,7 @@ class SQLiteDatabaseHandler:
         self._create_schema()
         self._ensure_person_columns()
         self._migrate_legacy_entry_storage()
+        self._migrate_legacy_visits_to_events()
         self._embedding_cache: dict[str, np.ndarray] = {}
         self._sample_embedding_cache: list[tuple[str, np.ndarray]] = []
         self._reload_embedding_cache()
@@ -92,6 +93,24 @@ class SQLiteDatabaseHandler:
 
                 CREATE INDEX IF NOT EXISTS idx_visits_person_id
                 ON visits(person_id);
+
+                CREATE TABLE IF NOT EXISTS visit_events (
+                    id TEXT PRIMARY KEY,
+                    person_id INTEGER NOT NULL,
+                    event_type TEXT NOT NULL CHECK(event_type IN ('entry', 'exit')),
+                    visit_number INTEGER NOT NULL,
+                    event_at INTEGER NOT NULL,
+                    photo_path TEXT NOT NULL,
+                    track_id INTEGER,
+                    created_at INTEGER NOT NULL,
+                    FOREIGN KEY (person_id) REFERENCES persons(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_visit_events_person_id
+                ON visit_events(person_id);
+
+                CREATE INDEX IF NOT EXISTS idx_visit_events_event_at
+                ON visit_events(event_at);
 
                 CREATE TABLE IF NOT EXISTS entered_person (
                     global_id TEXT PRIMARY KEY,
@@ -208,6 +227,48 @@ class SQLiteDatabaseHandler:
                 """,
             )
 
+    def _migrate_legacy_visits_to_events(self) -> None:
+        """Expose older visit snapshots as entry events in the new event log."""
+        with self._lock, self._connection:
+            existing_event = self._connection.execute(
+                "SELECT 1 FROM visit_events LIMIT 1"
+            ).fetchone()
+            if existing_event is not None:
+                return
+
+            legacy_visits = self._connection.execute(
+                """
+                SELECT person_id, id, visit_number, visited_at, photo_path, track_id, created_at
+                FROM visits
+                ORDER BY visited_at ASC, rowid ASC
+                """
+            ).fetchall()
+            for visit in legacy_visits:
+                self._connection.execute(
+                    """
+                    INSERT INTO visit_events (
+                        id,
+                        person_id,
+                        event_type,
+                        visit_number,
+                        event_at,
+                        photo_path,
+                        track_id,
+                        created_at
+                    )
+                    VALUES (?, ?, 'entry', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        f"legacy-entry-{visit['id']}",
+                        visit["person_id"],
+                        visit["visit_number"],
+                        visit["visited_at"],
+                        visit["photo_path"],
+                        visit["track_id"],
+                        visit["created_at"],
+                    ),
+                )
+
     @staticmethod
     def _embedding_array(embedding: np.ndarray | list[float]) -> np.ndarray:
         vector = np.asarray(embedding, dtype=np.float32).reshape(-1)
@@ -276,6 +337,27 @@ class SQLiteDatabaseHandler:
             (person_id,),
         ).fetchall()
 
+    def _visit_event_rows(self, person_id: int) -> list[sqlite3.Row]:
+        return self._connection.execute(
+            """
+            SELECT id, event_type, visit_number, event_at, photo_path, track_id
+            FROM visit_events
+            WHERE person_id = ?
+            ORDER BY event_at, rowid
+            """,
+            (person_id,),
+        ).fetchall()
+
+    def _visit_event_row_to_dict(self, row: sqlite3.Row) -> dict[str, Any]:
+        return {
+            "id": row["id"],
+            "event_type": row["event_type"],
+            "visit_number": row["visit_number"],
+            "timestamp": row["event_at"],
+            "photo_path": row["photo_path"],
+            "track_id": row["track_id"],
+        }
+
     def _row_to_record(self, row: sqlite3.Row, distance: float | None = None) -> dict[str, Any]:
         samples = [
             {
@@ -302,6 +384,10 @@ class SQLiteDatabaseHandler:
                 }
                 for visit in self._visit_rows(row["id"])
             ],
+            "visit_events_json": [
+                self._visit_event_row_to_dict(visit_event)
+                for visit_event in self._visit_event_rows(row["id"])
+            ],
             "classificaiton_confidence_threshold": row[
                 "classification_confidence_threshold"
             ],
@@ -326,6 +412,8 @@ class SQLiteDatabaseHandler:
             "avg_embedding": None,
             "last_sample_recieved_time": None,
             "samples_json": None,
+            "visits_json": [],
+            "visit_events_json": [],
             "classificaiton_confidence_threshold": None,
             "visit_count": 0,
             "entered": 0,
@@ -702,6 +790,66 @@ class SQLiteDatabaseHandler:
                 "track_id": row["track_id"],
             }
 
+    def add_visit_event(
+        self,
+        global_id: str,
+        event_type: str,
+        visit_number: int,
+        timestamp: int,
+        photo_path: str,
+        track_id: int | None = None,
+        event_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Store one entry/exit snapshot in the chronological event log."""
+        if event_type not in {"entry", "exit"}:
+            raise ValueError("event_type must be 'entry' or 'exit'.")
+
+        event_id = event_id or str(uuid.uuid4())
+        with self._lock, self._connection:
+            person = self._connection.execute(
+                "SELECT id FROM persons WHERE global_id = ?",
+                (global_id,),
+            ).fetchone()
+            if person is None:
+                raise KeyError(f"Person not found: {global_id}")
+
+            self._connection.execute(
+                """
+                INSERT INTO visit_events (
+                    id,
+                    person_id,
+                    event_type,
+                    visit_number,
+                    event_at,
+                    photo_path,
+                    track_id,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event_id,
+                    person["id"],
+                    event_type,
+                    visit_number,
+                    timestamp,
+                    photo_path,
+                    track_id,
+                    int(time.time()),
+                ),
+            )
+            row = self._connection.execute(
+                """
+                SELECT id, event_type, visit_number, event_at, photo_path, track_id
+                FROM visit_events
+                WHERE id = ?
+                """,
+                (event_id,),
+            ).fetchone()
+            if row is None:
+                raise RuntimeError("Failed to store visit event.")
+            return self._visit_event_row_to_dict(row)
+
     def insert_new_sample(
         self,
         record: dict[str, Any],
@@ -891,6 +1039,44 @@ class SQLiteDatabaseHandler:
             )
         return cards
 
+    def get_visit_events(self, limit: int | None = 100) -> list[dict[str, Any]]:
+        """Return the global entry/exit event log with person labels."""
+        with self._lock:
+            sql = """
+                SELECT
+                    visit_events.id,
+                    visit_events.event_type,
+                    visit_events.visit_number,
+                    visit_events.event_at,
+                    visit_events.photo_path,
+                    visit_events.track_id,
+                    persons.global_id,
+                    persons.label
+                FROM visit_events
+                JOIN persons ON persons.id = visit_events.person_id
+                ORDER BY visit_events.event_at DESC, visit_events.rowid DESC
+            """
+            if limit is None:
+                rows = self._connection.execute(sql).fetchall()
+            else:
+                rows = self._connection.execute(
+                    sql + " LIMIT ?",
+                    (max(1, min(limit, 1000)),),
+                ).fetchall()
+            return [
+                {
+                    "id": row["id"],
+                    "event_type": row["event_type"],
+                    "visit_number": row["visit_number"],
+                    "timestamp": row["event_at"],
+                    "photo_path": row["photo_path"],
+                    "track_id": row["track_id"],
+                    "global_id": row["global_id"],
+                    "label": row["label"],
+                }
+                for row in rows
+            ]
+
     def get_record_by_id(self, global_id: str) -> dict[str, Any] | None:
         with self._lock:
             row = self._connection.execute(
@@ -924,6 +1110,10 @@ class SQLiteDatabaseHandler:
             visit_paths = [
                 visit["photo_path"] for visit in self._visit_rows(row["id"])
             ]
+            visit_event_paths = [
+                visit_event["photo_path"]
+                for visit_event in self._visit_event_rows(row["id"])
+            ]
             self._connection.execute("DELETE FROM persons WHERE id = ?", (row["id"],))
             self._embedding_cache.pop(global_id, None)
             self._sample_embedding_cache = [
@@ -931,7 +1121,7 @@ class SQLiteDatabaseHandler:
                 for candidate_id, embedding in self._sample_embedding_cache
                 if candidate_id != global_id
             ]
-        for sample_path in [*sample_paths, *visit_paths]:
+        for sample_path in [*sample_paths, *visit_paths, *visit_event_paths]:
             self._delete_sample_file(sample_path)
 
     def clear_table(self) -> None:

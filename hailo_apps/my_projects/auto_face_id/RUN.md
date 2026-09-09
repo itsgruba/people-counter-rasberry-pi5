@@ -165,6 +165,7 @@ uvicorn hailo_apps.my_projects.auto_face_id.person_face_api:app --host 127.0.0.1
 ```text
 http://127.0.0.1:8000/api/people
 http://127.0.0.1:8000/api/entered-people
+http://127.0.0.1:8000/api/visit-events
 ```
 
 - The default resources for person detection, face detection, and face recognition are resolved automatically by the app.
