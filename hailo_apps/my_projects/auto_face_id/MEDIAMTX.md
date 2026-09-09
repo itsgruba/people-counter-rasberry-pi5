@@ -19,7 +19,7 @@
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --camera-mode entry \
   --input rtsp://127.0.0.1:8554/cam \
-  --width 640 --height 640 --frame-rate 15 \
+  --width 640 --height 360 --frame-rate 15 \
   --disable-sync --disable-local-display \
   --debug-stream-transport rtsp \
   --debug-rtsp-url rtsp://127.0.0.1:8554/debug \
