@@ -1,6 +1,6 @@
 #!/bin/bash
 
-cd /home/aleksandr/hailo-apps || exit 1
+cd "$(dirname "$0")" || exit 1
 
 source setup_env.sh
 
@@ -8,7 +8,6 @@ mkdir -p logs
 
 cleanup() {
     echo "Stopping processes..."
-    kill "$STREAM_PID" 2>/dev/null
     kill "$API_PID" 2>/dev/null
     kill "$ENTRY_PID" 2>/dev/null
     kill "$EXIT_PID" 2>/dev/null
@@ -16,13 +15,7 @@ cleanup() {
 
 trap cleanup EXIT INT TERM
 
-echo "Starting stream..."
-
-python3 hailo_apps/my_projects/auto_face_id/stream.py \
-    >> logs/stream.log 2>&1 &
-
-STREAM_PID=$!
-
+# MediaMTX must already be running on each camera host; it owns the camera.
 
 echo "Starting API..."
 
@@ -40,7 +33,7 @@ echo "Starting ENTRY..."
 
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
     --camera-mode entry \
-    --input http://192.168.0.2:8080/stream \
+    --input "${ENTRY_INPUT:-rtsp://127.0.0.1:8554/cam}" \
     --width 640 \
     --height 640 \
     --disable-sync \
@@ -61,13 +54,13 @@ echo "Starting EXIT..."
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
     --camera-mode exit \
     --exit-recognition-zone-file hailo_apps/my_projects/auto_face_id/exit_recognition_zone.txt \
-    --input http://192.168.0.3:8080/stream \
+    --input "${EXIT_INPUT:-rtsp://192.168.0.3:8554/cam}" \
     --width 640 \
     --height 640 \
     --disable-sync \
     --show-fps \
     --disable-local-display \
-    --debug-stream-port 8091 \
+    --debug-rtsp-url rtsp://127.0.0.1:8554/debug-exit \
     --notify-url http://192.168.0.3:8000/api/events \
     >> logs/exit.log 2>&1 &
 

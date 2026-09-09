@@ -85,6 +85,7 @@ from hailo_apps.python.core.gstreamer.gstreamer_helper_pipelines import (
     USER_CALLBACK_PIPELINE,
 )
 from hailo_apps.my_projects.auto_face_id.sqlite_db_handler import SQLiteDatabaseHandler
+from hailo_apps.my_projects.auto_face_id.rtsp_debug import RtspDebugPublisher
 
 logger = get_logger(__name__)
 
@@ -491,6 +492,7 @@ class PersonFaceIdApp(GStreamerApp):
         self.person_class_id = self.options_menu.person_class_id
         self.debug_face_overlay = self.options_menu.use_frame
         self.debug_stream_enabled = not self.options_menu.disable_debug_stream
+        self.rtsp_debug = None
         self.debug_stream_host = self.options_menu.debug_stream_host
         self.debug_stream_port = self.options_menu.debug_stream_port
         self.debug_jpeg_quality = self.options_menu.debug_jpeg_quality
@@ -703,11 +705,19 @@ class PersonFaceIdApp(GStreamerApp):
         if self.options_menu.disable_local_display:
             self.video_sink = "fakesink"
 
-        if self.debug_stream_enabled:
+        if self.debug_stream_enabled and self.options_menu.debug_stream_transport == "http":
             self._start_debug_stream_server()
 
         self.create_pipeline()
         self._connect_face_embedding_callback()
+        if self.debug_stream_enabled and self.options_menu.debug_stream_transport == "rtsp":
+            if self.options_menu.debug_rtsp_url == self.video_source:
+                raise ValueError("Input and debug RTSP URLs must differ")
+            self.rtsp_debug = RtspDebugPublisher(
+                self.options_menu.debug_rtsp_url,
+                self.options_menu.debug_stream_fps,
+                self.options_menu.debug_bitrate,
+            )
 
     # ------------------------------------------------------------------
     # CLI and live configuration
@@ -716,6 +726,12 @@ class PersonFaceIdApp(GStreamerApp):
     @staticmethod
     def _build_parser() -> argparse.ArgumentParser:
         parser = get_pipeline_parser()
+        parser.add_argument("--debug-stream-transport", choices=("rtsp", "http"), default="rtsp")
+        parser.add_argument("--debug-rtsp-url", default="rtsp://127.0.0.1:8554/debug")
+        parser.add_argument("--debug-stream-fps", type=int, choices=range(1, 61), default=10)
+        parser.add_argument("--debug-bitrate", type=int, default=2000, help="H.264 debug bitrate in kbit/s")
+        parser.add_argument("--rtsp-latency-ms", type=int, default=100)
+
         parser.description = "Track person detections and run face detection/recognition inside each person ROI."
         parser.add_argument(
             "--person-hef-path",
@@ -1003,7 +1019,7 @@ class PersonFaceIdApp(GStreamerApp):
         parser.add_argument(
             "--disable-debug-stream",
             action="store_true",
-            help="Disable the built-in Flask MJPEG debug stream.",
+            help="Disable debug video output.",
         )
         parser.add_argument(
             "--debug-stream-host",
@@ -3435,6 +3451,8 @@ class PersonFaceIdApp(GStreamerApp):
     @staticmethod
     def _is_pairing_sensitive_queue(queue_name: str) -> bool:
         """Queues inside cropper/aggregator branches should not drop one side of a frame pair."""
+        if queue_name.endswith("_queue_decode"):
+            return True  # Never drop compressed RTP/H.264 packets before decoding.
         if queue_name.endswith("_bypass_q"):
             return True
         if queue_name == "detector_pos_face_align_q":
@@ -3537,6 +3555,12 @@ class PersonFaceIdApp(GStreamerApp):
             # For live HTTP cameras we still want --frame-rate to throttle input.
             source_kwargs["sync"] = True
         source_pipeline = self.get_source_pipeline(**source_kwargs)
+        if self.source_type == "rtsp":
+            source_pipeline = source_pipeline.replace(
+                "rtspsrc ",
+                f"rtspsrc protocols=tcp latency={max(0, self.options_menu.rtsp_latency_ms)} drop-on-latency=true ",
+                1,
+            )
 
         person_detection_pipeline = INFERENCE_PIPELINE(
             hef_path=self.person_hef_path,
@@ -3665,9 +3689,10 @@ class PersonFaceIdApp(GStreamerApp):
         pad = element.get_static_pad("src")
         fmt, width, height = get_caps_from_pad(pad)
         frame_number = user_data.get_count()
+        debug_due = self.debug_stream_enabled and (self.rtsp_debug is None or self.rtsp_debug.due())
         needs_frame = (
             self.debug_face_overlay
-            or self.debug_stream_enabled
+            or debug_due
             or self.entry_counter_enabled
             or self.exit_counter_enabled
         )
@@ -3678,7 +3703,7 @@ class PersonFaceIdApp(GStreamerApp):
         )
         self._update_entry_counter(person_detections, frame_number, frame, width, height)
         self._update_exit_counter(person_detections, frame_number, frame, width, height)
-        needs_debug_frame = self.debug_face_overlay or self.debug_stream_enabled
+        needs_debug_frame = self.debug_face_overlay or debug_due
 
         # Recognition flow per face:
         # 1. Find the person box that contains the face.
@@ -3854,8 +3879,11 @@ class PersonFaceIdApp(GStreamerApp):
             )
             if self.debug_face_overlay:
                 user_data.set_frame(debug_frame)
-            if self.debug_stream_enabled:
-                user_data.set_debug_frame(debug_frame, frame_number, self.debug_jpeg_quality)
+            if debug_due:
+                if self.rtsp_debug is not None:
+                    self.rtsp_debug.submit(debug_frame)
+                else:
+                    user_data.set_debug_frame(debug_frame, frame_number, self.debug_jpeg_quality)
 
         self._log_recognition_stats(frame_number)
         return Gst.FlowReturn.OK
@@ -3865,7 +3893,11 @@ def main() -> None:
     logger.info("Starting person-face ID app.")
     user_data = PersonFaceIdData()
     app = PersonFaceIdApp(user_data)
-    app.run()
+    try:
+        app.run()
+    finally:
+        if app.rtsp_debug is not None:
+            app.rtsp_debug.close()
 
 
 if __name__ == "__main__":

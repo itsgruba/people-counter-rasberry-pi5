@@ -1,0 +1,13 @@
+# Run on the Raspberry Pi. Do not run stream.py alongside this camera source.
+rtsp: yes
+rtspAddress: :8554
+paths:
+  cam:
+    source: rpiCamera
+    rpiCameraWidth: 1640
+    rpiCameraHeight: 1640
+    rpiCameraFPS: 15
+  debug:
+    source: publisher
+  debug-exit:
+    source: publisher

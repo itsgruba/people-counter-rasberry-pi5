@@ -1,3 +1,7 @@
+> Новый рекомендуемый запуск через MediaMTX: [MEDIAMTX.md](MEDIAMTX.md).
+> Debug по умолчанию теперь RTSP `/debug`; для HTTP-команд ниже добавьте
+> `--debug-stream-transport http`.
+
 # Run Guide
 
 This guide is for the combined `person -> face` prototype.
