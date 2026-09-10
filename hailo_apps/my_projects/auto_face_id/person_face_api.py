@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -127,14 +127,23 @@ class VisitEventRef(BaseModel):
     )
 
 
-class VisitEventCard(VisitEventRef):
-    global_id: str = Field(..., examples=["3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1"])
-    label: str = Field(..., examples=["person_1"])
+class ExitCard(BaseModel):
+    id: str
+    global_id: str
+    label: str
+    visit_number: int
+    entered_at: int | None = None
+    exited_at: int
+    duration_seconds: int | None = None
+    entry_photo_url: str | None = None
+    exit_photo_url: str | None = None
 
 
-class VisitEventsResponse(BaseModel):
-    visit_events: list[VisitEventCard]
-    count: int = Field(..., examples=[2])
+class ExitsResponse(BaseModel):
+    items: list[ExitCard]
+    total: int
+    limit: int
+    offset: int
 
 
 class PersonDetails(BaseModel):
@@ -270,28 +279,6 @@ PERSON_EXAMPLE = {
         ],
     }
 }
-VISIT_EVENTS_EXAMPLE = {
-    "visit_events": [
-        {
-            "id": "event-2",
-            "event_type": "exit",
-            "visit_number": 1,
-            "timestamp": 1717500300,
-            "track_id": 21,
-            "photo_name": (
-                "person_1/visit_events/visit_1/exit/"
-                "snapshot_1717500300_track_21.jpeg"
-            ),
-            "photo_url": (
-                "http://127.0.0.1:8000/samples/person_1/visit_events/visit_1/"
-                "exit/snapshot_1717500300_track_21.jpeg"
-            ),
-            "global_id": "3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1",
-            "label": "person_1",
-        }
-    ],
-    "count": 1,
-}
 EVENT_EXAMPLE = {
     "event": "recognized",
     "global_id": "3f0d7e6f-2a8f-4f8a-98f7-0f4f7f73c2f1",
@@ -389,6 +376,14 @@ def _person_card_response(
         thumbnail_path = samples[0].get("sample_path")
         thumbnail_name = _sample_name(thumbnail_path)
         thumbnail_url = _sample_absolute_url(request, thumbnail_path)
+
+    if not thumbnail_url:
+        entries = [event for event in person.get("visit_events_json", [])
+                   if event.get("event_type") == "entry" and event.get("photo_path")]
+        if entries:
+            latest = max(entries, key=lambda event: event.get("timestamp") or 0)
+            thumbnail_name = _sample_name(latest["photo_path"])
+            thumbnail_url = _sample_absolute_url(request, latest["photo_path"])
 
     return {
         "global_id": person["global_id"],
@@ -512,16 +507,23 @@ def _state_snapshot(
         _entered_person_response(row, row["person"], request)
         for row in db.get_people_inside(limit=None)
     ]
-    visit_events = [
-        _visit_event_response(visit_event, request)
-        for visit_event in db.get_visit_events(limit=None)
-    ]
     return {
         "people": people,
         "entered_people": entered_people,
-        "visit_events": visit_events,
+        "exits": _exits_response(db, request, 50, 0),
         "total_entered": db.get_total_entered(),
     }
+
+
+def _exits_response(db, request, limit, offset):
+    result = db.get_exits(limit, offset)
+    for item in result["items"]:
+        item["entry_photo_url"] = _sample_absolute_url(request, item.pop("entry_photo_path"))
+        item["exit_photo_url"] = _sample_absolute_url(request, item.pop("exit_photo_path"))
+        item["duration_seconds"] = (item["exited_at"] - item["entered_at"]
+                                    if item["entered_at"] is not None else None)
+    return result
+
 
 
 class WebSocketManager:
@@ -561,7 +563,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="Person Face API",
-    version="1.0.0",
+    version="2.0.0",
     description="Backend for listing people, sample images, visit counters, and entry/exit events.",
     lifespan=lifespan,
 )
@@ -574,7 +576,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.mount("/samples", StaticFiles(directory=str(SAMPLES_DIR)), name="samples")
+app.mount("/samples", StaticFiles(directory=str(SAMPLES_DIR), check_dir=False), name="samples")
 
 
 def _db(request: Request) -> SQLiteDatabaseHandler:
@@ -601,7 +603,9 @@ def health() -> HealthResponse:
 )
 def list_people(request: Request) -> PeopleResponse:
     db = _db(request)
-    people = _state_snapshot(db, request)["people"]
+    people = db.get_people_cards()
+    for person in people:
+        person["thumbnail_url"] = _absolute_url(request, _sample_url(person.get("thumbnail_name")))
     return {"people": people, "count": len(people)}
 
 
@@ -612,29 +616,24 @@ def list_people(request: Request) -> PeopleResponse:
 )
 def list_entered_people(request: Request, limit: int = 100) -> EnteredPeopleResponse:
     db = _db(request)
-    state = _state_snapshot(db, request)
-    entered_people = state["entered_people"]
-    if limit > 0:
-        entered_people = entered_people[:limit]
+    entered_people = [
+        _entered_person_response(row, row["person"], request)
+        for row in db.get_people_inside(limit=limit if limit > 0 else None)
+    ]
 
     return {
         "entered_people": entered_people,
-        "total_inside": state["total_entered"],
+        "total_inside": db.get_total_entered(),
     }
 
 
-@app.get(
-    "/api/visit-events",
-    response_model=VisitEventsResponse,
-    responses={200: {"content": {"application/json": {"example": VISIT_EVENTS_EXAMPLE}}}},
-)
-def list_visit_events(request: Request, limit: int = 100) -> VisitEventsResponse:
-    db = _db(request)
-    visit_events = [
-        _visit_event_response(visit_event, request)
-        for visit_event in db.get_visit_events(limit=limit if limit > 0 else None)
-    ]
-    return {"visit_events": visit_events, "count": len(visit_events)}
+@app.get("/api/exits", response_model=ExitsResponse)
+def list_exits(
+    request: Request,
+    limit: int = Query(default=50, ge=1, le=1000),
+    offset: int = Query(default=0, ge=0),
+) -> ExitsResponse:
+    return _exits_response(_db(request), request, limit, offset)
 
 
 @app.get(

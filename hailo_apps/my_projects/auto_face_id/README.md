@@ -146,7 +146,7 @@ It exposes:
 - `GET /api/people` - lightweight карточки людей with `label`, `visit_count`, `thumbnail_url`
 - `GET /api/people/{global_id}` - full record for one person, including `samples`, `visits`, and `visit_events`
 - `GET /api/entered-people` - people currently inside, with their linked photos
-- `GET /api/visit-events` - one chronological list of all `entry` and `exit` photos
+- `GET /api/exits?limit=50&offset=0` - completed exits with paired entry/exit photos, timestamps, duration, and pagination
 - `DELETE /api/people/{global_id}` - delete one person and their saved sample files
 - `GET /samples/{filename}` - serves the saved JPEG sample images
 - `POST /api/events` - optional event sink for camera notifications

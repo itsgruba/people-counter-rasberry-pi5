@@ -19,7 +19,7 @@ trap cleanup EXIT INT TERM
 
 echo "Starting API..."
 
-fastapi dev \
+python3 \
     hailo_apps/my_projects/auto_face_id/person_face_api.py \
     --host 0.0.0.0 \
     >> logs/api.log 2>&1 &
@@ -40,7 +40,7 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
     --show-fps \
     --disable-local-display \
     --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt \
-    --notify-url http://192.168.0.3:8000/api/events \
+    --notify-url "${NOTIFY_URL:-http://127.0.0.1:8000/api/events}" \
     --samples-per-person 3 \
     --unknown-sample-interval 2 \
     --min-unknown-age-seconds 0.5 \
@@ -61,7 +61,7 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
     --show-fps \
     --disable-local-display \
     --debug-rtsp-url rtsp://127.0.0.1:8554/debug-exit \
-    --notify-url http://192.168.0.3:8000/api/events \
+    --notify-url "${NOTIFY_URL:-http://127.0.0.1:8000/api/events}" \
     >> logs/exit.log 2>&1 &
 
 EXIT_PID=$!

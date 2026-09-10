@@ -112,6 +112,9 @@ class SQLiteDatabaseHandler:
                 CREATE INDEX IF NOT EXISTS idx_visit_events_event_at
                 ON visit_events(event_at);
 
+                CREATE INDEX IF NOT EXISTS idx_visit_events_person_type_time
+                ON visit_events(person_id, event_type, event_at);
+
                 CREATE TABLE IF NOT EXISTS entered_person (
                     global_id TEXT PRIMARY KEY,
                     label TEXT NOT NULL,
@@ -1019,25 +1022,55 @@ class SQLiteDatabaseHandler:
             return [self._row_to_record(row) for row in rows]
 
     def get_people_cards(self) -> list[dict[str, Any]]:
-        """Return lightweight person summaries for a frontend dashboard."""
-        cards = []
-        for record in self.get_all_records():
-            thumbnail_path = None
-            if record["samples_json"]:
-                sample_path = record["samples_json"][0]["sample_path"]
-                if sample_path:
-                    thumbnail_path = self._sample_relative_path(sample_path)
-            cards.append(
-                {
-                    "global_id": record["global_id"],
-                    "label": record["label"],
-                    "visit_count": int(record["visit_count"]),
-                    "last_seen_at": record["last_seen_at"],
-                    "thumbnail_name": thumbnail_path,
-                    "sample_count": len(record["samples_json"] or []),
-                }
-            )
-        return cards
+        """Summaries without loading embeddings or each person's entire history."""
+        with self._lock:
+            rows = self._connection.execute("""
+                SELECT p.global_id, p.label, p.visits_count AS visit_count, p.last_seen_at,
+                    (SELECT COUNT(*) FROM face_samples s WHERE s.person_id=p.id) AS sample_count,
+                    COALESCE(
+                        (SELECT NULLIF(s.sample_path, '') FROM face_samples s
+                         WHERE s.person_id=p.id ORDER BY s.rowid LIMIT 1),
+                        (SELECT NULLIF(e.photo_path, '') FROM visit_events e
+                         WHERE e.person_id=p.id AND e.event_type='entry'
+                         ORDER BY e.event_at DESC, e.rowid DESC LIMIT 1)
+                    ) AS thumbnail_name
+                FROM persons p ORDER BY p.id
+            """).fetchall()
+            return [dict(row, thumbnail_name=self._sample_relative_path(row["thumbnail_name"])) for row in rows]
+
+    def get_exits(self, limit: int = 50, offset: int = 0) -> dict[str, Any]:
+        """Pair each exit with the latest entry since this person's previous exit.
+
+        Timeline pairing also supports legacy data where visit_number changed
+        when a camera assigned a new track. Never reuse an earlier visit's photo.
+        """
+        with self._lock:
+            total = self._connection.execute(
+                "SELECT COUNT(*) FROM visit_events WHERE event_type='exit'"
+            ).fetchone()[0]
+            rows = self._connection.execute("""
+                SELECT x.id, p.global_id, p.label, x.visit_number,
+                       e.event_at AS entered_at, x.event_at AS exited_at,
+                       e.photo_path AS entry_photo_path, x.photo_path AS exit_photo_path
+                FROM visit_events x
+                JOIN persons p ON p.id=x.person_id
+                LEFT JOIN visit_events e ON e.rowid=(
+                    SELECT candidate.rowid FROM visit_events candidate
+                    WHERE candidate.person_id=x.person_id AND candidate.event_type='entry'
+                      AND (candidate.event_at, candidate.rowid) <= (x.event_at, x.rowid)
+                      AND NOT EXISTS (
+                          SELECT 1 FROM visit_events previous
+                          WHERE previous.person_id=x.person_id AND previous.event_type='exit'
+                            AND (previous.event_at, previous.rowid) > (candidate.event_at, candidate.rowid)
+                            AND (previous.event_at, previous.rowid) < (x.event_at, x.rowid)
+                      )
+                    ORDER BY candidate.event_at DESC, candidate.rowid DESC LIMIT 1
+                )
+                WHERE x.event_type='exit'
+                ORDER BY x.event_at DESC, x.rowid DESC LIMIT ? OFFSET ?
+            """, (limit, offset)).fetchall()
+            return {"items": [dict(row) for row in rows], "total": total,
+                    "limit": limit, "offset": offset}
 
     def get_visit_events(self, limit: int | None = 100) -> list[dict[str, Any]]:
         """Return the global entry/exit event log with person labels."""

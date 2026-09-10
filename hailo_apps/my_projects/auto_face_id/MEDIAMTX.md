@@ -26,6 +26,7 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --debug-stream-transport rtsp \
   --debug-rtsp-url rtsp://127.0.0.1:8554/debug_rpi5 \
   --debug-stream-fps 8 --debug-stream-width 960 --debug-bitrate 1200 \
+  --notify-url http://127.0.0.1:8000/api/events \
   --exit-recognition-zone-file hailo_apps/my_projects/auto_face_id/exit_recognition_zone.txt
 
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
@@ -36,6 +37,7 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --debug-stream-transport rtsp \
   --debug-rtsp-url rtsp://127.0.0.1:8554/debug_zero \
   --debug-stream-fps 8 --debug-stream-width 960 --debug-bitrate 1200 \
+  --notify-url http://127.0.0.1:8000/api/events \
   --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt
 ```
 
@@ -91,3 +93,15 @@ RTSP с debug. Используйте `top -H`, `pidstat -u 1` (пакет sysst
 Источники: [камеры Raspberry Pi в MediaMTX](https://mediamtx.org/docs/publish/raspberry-pi-cameras),
 [публикация RTSP](https://mediamtx.org/docs/publish/rtsp-clients),
 [H.264 на Pi5](https://pip-assets.raspberrypi.com/categories/685-app-notes-guides-whitepapers/documents/RP-010033-WP-1-H.264%20encoding%20performance%20on%20Raspberry%20Pi%205_series%20computers.pdf).
+
+
+Перед запуском камер запустите backend на той же Pi и из той же копии проекта:
+
+```bash
+python3 hailo_apps/my_projects/auto_face_id/person_face_api.py --host 0.0.0.0 --port 8000
+```
+
+`--notify-url http://127.0.0.1:8000/api/events` в обеих командах включает
+уведомления backend для WebSocket. Без этого параметра HTTP читает БД, но
+обновления от камер по WebSocket не отправляются. `start_all.sh` запускает API
+без development reload и использует этот локальный адрес (переопределяется `NOTIFY_URL`).
