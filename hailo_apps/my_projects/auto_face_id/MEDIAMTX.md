@@ -39,6 +39,17 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --debug-stream-fps 8 --debug-stream-width 960 --debug-bitrate 1200 \
   --notify-url http://127.0.0.1:8000/api/events \
   --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --camera-mode entry \
+  --input rtsp://127.0.0.1:8554/cam \
+  --width 1920 --height 1080 --frame-rate 15 \
+  --disable-sync --disable-local-display \
+  --debug-stream-transport rtsp \
+  --debug-rtsp-url rtsp://127.0.0.1:8554/debug_rpi5 \
+  --debug-stream-fps 8 --debug-stream-width 960 --debug-bitrate 1200 \
+  --notify-url http://127.0.0.1:8000/api/events \
+  --enroll-zone-file hailo_apps/my_projects/auto_face_id/exit_recognition_zone.txt
 ```
 
 Добавьте прежние параметры уведомлений, регистрации и счётчиков из вашей
