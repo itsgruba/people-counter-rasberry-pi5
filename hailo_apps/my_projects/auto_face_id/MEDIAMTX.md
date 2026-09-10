@@ -26,7 +26,7 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --debug-stream-transport rtsp \
   --debug-rtsp-url rtsp://127.0.0.1:8554/debug_rpi5 \
   --debug-stream-fps 30 --debug-bitrate 2000 \
-  --enroll-zone-file hailo_apps/my_projects/auto_face_id/exit_recognition_zone.txt
+  --exit-recognition-zone-file hailo_apps/my_projects/auto_face_id/exit_recognition_zone.txt
 
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --camera-mode entry \
