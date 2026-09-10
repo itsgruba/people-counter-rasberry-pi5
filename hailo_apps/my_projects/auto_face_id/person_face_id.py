@@ -690,6 +690,11 @@ class PersonFaceIdApp(GStreamerApp):
         # short-lived camera-session IDs; global_id is the persistent DB identity.
         self.pending_unknowns: dict[int, PendingIdentity] = {}
         self.known_track_last_sample_frame: dict[int, int] = {}
+        self.person_track_last_seen_frame: dict[int, int] = {}
+        self.identity_track_max_gap_frames = max(
+            1,
+            self.options_menu.identity_track_max_gap_frames,
+        )
         self.face_track_embeddings: dict[int, np.ndarray] = {}
         self.track_to_global_id: dict[int, str] = {}
         self.track_to_label: dict[int, str] = {}
@@ -826,6 +831,15 @@ class PersonFaceIdApp(GStreamerApp):
             help=(
                 "Maximum age for unresolved pending unknown identities. "
                 "Expired pending samples are deleted. Use 0 to disable cleanup."
+            ),
+        )
+        parser.add_argument(
+            "--identity-track-max-gap-frames",
+            type=int,
+            default=8,
+            help=(
+                "Forget a person-track identity after this many frames without that track. "
+                "Prevents a recycled Hailo track ID from reusing an earlier admission. Default: 8."
             ),
         )
         parser.add_argument(
@@ -2355,6 +2369,12 @@ class PersonFaceIdApp(GStreamerApp):
     def _on_pipeline_rebuilt(self) -> None:
         self.face_track_embeddings.clear()
         self.known_track_last_sample_frame.clear()
+        runtime_track_ids = set(self.person_track_last_seen_frame) | set(
+            self.track_to_global_id
+        )
+        for track_id in runtime_track_ids:
+            self._reset_runtime_person_track(track_id, "pipeline-rebuilt")
+        self.person_track_last_seen_frame.clear()
         self._connect_face_embedding_callback()
 
     def face_embedding_callback(self, pad, info):
@@ -3141,6 +3161,43 @@ class PersonFaceIdApp(GStreamerApp):
         for track_id in expired_track_ids:
             self._discard_pending_identity(track_id, "expired")
 
+    def _reset_runtime_person_track(self, track_id: int, reason: str) -> None:
+        """Forget camera-session state before Hailo can recycle a numeric track ID."""
+        context = self.pending_entry_contexts.get(track_id)
+        if context is not None and self.entry_detector.has_uncounted_crossing(track_id):
+            self._resolve_pending_entry_as_new_person(
+                context,
+                reason=f"{reason}-pending-entry",
+            )
+
+        self.track_to_global_id.pop(track_id, None)
+        self.track_to_label.pop(track_id, None)
+        self.last_printed_identity.pop(track_id, None)
+        self.known_track_last_sample_frame.pop(track_id, None)
+        self.pending_entry_contexts.pop(track_id, None)
+        self._discard_pending_identity(track_id, reason)
+        self.entry_detector.tracks.pop(track_id, None)
+        self.exit_detector.tracks.pop(track_id, None)
+        logger.info("Reset runtime person track_id=%d reason=%s", track_id, reason)
+
+    def _cleanup_stale_person_tracks(
+        self,
+        active_track_ids: set[int],
+        frame_number: int,
+    ) -> None:
+        """Expire missing tracks so a later admission always starts with no identity."""
+        stale_track_ids = [
+            track_id
+            for track_id, last_frame in self.person_track_last_seen_frame.items()
+            if frame_number - last_frame > self.identity_track_max_gap_frames
+        ]
+        for track_id in stale_track_ids:
+            self._reset_runtime_person_track(track_id, "track-gap")
+            self.person_track_last_seen_frame.pop(track_id, None)
+
+        for track_id in active_track_ids:
+            self.person_track_last_seen_frame[track_id] = frame_number
+
     def _bind_existing_person(
         self,
         track_id: int,
@@ -3779,6 +3836,15 @@ class PersonFaceIdApp(GStreamerApp):
         detections = roi.get_objects_typed(hailo.HAILO_DETECTION)
         face_detections = [d for d in detections if d.get_label() == "face"]
         person_detections = [d for d in detections if d.get_label() == "person"]
+        frame_number = user_data.get_count()
+        active_person_track_ids = {
+            track_id
+            for track_id in (
+                self._get_track_id(detection) for detection in person_detections
+            )
+            if track_id is not None
+        }
+        self._cleanup_stale_person_tracks(active_person_track_ids, frame_number)
 
         # Always attach the best currently known label to every person track so
         # the display/debug branches can show stable IDs even before a new
@@ -3798,7 +3864,6 @@ class PersonFaceIdApp(GStreamerApp):
 
         pad = element.get_static_pad("src")
         fmt, width, height = get_caps_from_pad(pad)
-        frame_number = user_data.get_count()
         debug_due = self.debug_stream_enabled and (self.rtsp_debug is None or self.rtsp_debug.due())
         needs_frame = (
             self.debug_face_overlay

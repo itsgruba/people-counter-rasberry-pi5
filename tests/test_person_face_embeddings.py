@@ -2,6 +2,7 @@
 
 import ast
 from dataclasses import dataclass, field
+import logging
 from pathlib import Path
 import tempfile
 import time
@@ -26,6 +27,8 @@ NAMES = {
     "_handle_unknown_person",
     "_record_pending_vote",
     "_stable_pending_vote",
+    "_reset_runtime_person_track",
+    "_cleanup_stale_person_tracks",
 }
 nodes = []
 for node in TREE.body:
@@ -51,6 +54,7 @@ namespace = {
     "Path": Path,
     "time": time,
     "uuid": uuid,
+    "logger": logging.getLogger(__name__),
 }
 module = ast.Module(
     body=[
@@ -151,6 +155,32 @@ class PlaceholderBackfillTests(unittest.TestCase):
             self.assertEqual(match["global_id"], person["global_id"])
             self.assertIsNone(match["samples_json"][0]["sample_path"])
             database.close()
+
+
+class TrackReuseTests(unittest.TestCase):
+    def test_recycled_track_id_does_not_reuse_previous_person(self):
+        app = App()
+        app.identity_track_max_gap_frames = 8
+        app.person_track_last_seen_frame = {43: 1}
+        app.track_to_global_id = {43: "old-person"}
+        app.track_to_label = {43: "person_2"}
+        app.last_printed_identity = {43: "old-person:person_2:recognized"}
+        app.known_track_last_sample_frame = {43: 1}
+        app.pending_entry_contexts = {}
+        app.entry_detector = SimpleNamespace(
+            tracks={43: object()},
+            has_uncounted_crossing=lambda track_id: False,
+        )
+        app.exit_detector = SimpleNamespace(tracks={43: object()})
+        app._discard_pending_identity = Mock()
+
+        app._cleanup_stale_person_tracks({43}, frame_number=10)
+
+        self.assertNotIn(43, app.track_to_global_id)
+        self.assertNotIn(43, app.track_to_label)
+        self.assertNotIn(43, app.entry_detector.tracks)
+        self.assertNotIn(43, app.exit_detector.tracks)
+        self.assertEqual(app.person_track_last_seen_frame[43], 10)
 
 
 if __name__ == "__main__":
