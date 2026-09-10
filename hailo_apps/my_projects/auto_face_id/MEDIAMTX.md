@@ -16,14 +16,26 @@
 4. Из корня проекта, после `source setup_env.sh`:
 
 ```bash
+source /home/aleksandr/hailo-apps/venv_hailo_apps/bin/activate
+
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
-  --camera-mode entry \
+  --camera-mode exit \
   --input rtsp://127.0.0.1:8554/cam \
-  --width 640 --height 360 --frame-rate 15 \
+  --width 1920 --height 1080 --frame-rate 15 \
   --disable-sync --disable-local-display \
   --debug-stream-transport rtsp \
   --debug-rtsp-url rtsp://127.0.0.1:8554/debug \
-  --debug-stream-fps 10 --debug-bitrate 2000 \
+  --debug-stream-fps 30 --debug-bitrate 2000 \
+  --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt
+
+python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
+  --camera-mode entry \
+  --input rtsp://127.0.0.1:9001/cam \
+  --width 1920 --height 1080 --frame-rate 15 \
+  --disable-sync --disable-local-display \
+  --debug-stream-transport rtsp \
+  --debug-rtsp-url rtsp://127.0.0.1:9001/debug \
+  --debug-stream-fps 30 --debug-bitrate 2000 \
   --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt
 ```
 
