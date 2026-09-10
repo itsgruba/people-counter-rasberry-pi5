@@ -509,6 +509,9 @@ class PersonFaceIdApp(GStreamerApp):
         self.debug_stream_host = self.options_menu.debug_stream_host
         self.debug_stream_port = self.options_menu.debug_stream_port
         self.debug_jpeg_quality = self.options_menu.debug_jpeg_quality
+        self.debug_stream_width = self.options_menu.debug_stream_width
+        if self.debug_stream_width < 0 or self.debug_stream_width == 1:
+            raise ValueError("--debug-stream-width must be 0 (original) or at least 2")
         self.debug_show_stats = not self.options_menu.debug_stream_no_stats
         self.low_latency_enabled = not self.options_menu.disable_low_latency
         self.low_latency_queue_size = max(1, self.options_menu.low_latency_queue_size)
@@ -742,6 +745,8 @@ class PersonFaceIdApp(GStreamerApp):
         parser.add_argument("--debug-stream-transport", choices=("rtsp", "http"), default="rtsp")
         parser.add_argument("--debug-rtsp-url", default="rtsp://127.0.0.1:8554/debug")
         parser.add_argument("--debug-stream-fps", type=int, choices=range(1, 61), default=10)
+        parser.add_argument("--debug-stream-width", type=int, default=0,
+                            help="Maximum debug width; preserve aspect ratio, never upscale. 0 keeps original size.")
         parser.add_argument("--debug-bitrate", type=int, default=2000, help="H.264 debug bitrate in kbit/s")
         parser.add_argument("--rtsp-latency-ms", type=int, default=100)
 
@@ -2626,6 +2631,15 @@ class PersonFaceIdApp(GStreamerApp):
         self._debug_fps_frames = 0
         self._debug_fps_updated_at = now
 
+    def _prepare_debug_frame(self, frame: np.ndarray) -> np.ndarray:
+        """Return owned debug pixels without changing the recognition frame."""
+        height, width = frame.shape[:2]
+        target_width = self.debug_stream_width
+        if target_width and target_width < width:
+            target_height = max(1, round(height * target_width / width))
+            return cv2.resize(frame, (target_width, target_height), interpolation=cv2.INTER_AREA)
+        return frame.copy()
+
     def _draw_debug_overlay(
         self,
         frame: np.ndarray,
@@ -3825,18 +3839,23 @@ class PersonFaceIdApp(GStreamerApp):
             )
 
         if frame is not None and needs_debug_frame:
-            debug_frame = frame.copy()
+            # Local UI expects the original dimensions. Headless debug can be
+            # resized before drawing, copying and encoding fewer pixels.
+            debug_frame = frame.copy() if self.debug_face_overlay else self._prepare_debug_frame(frame)
+            debug_height, debug_width = debug_frame.shape[:2]
             self._draw_debug_overlay(
                 debug_frame,
                 person_detections,
                 face_detections,
-                width,
-                height,
+                debug_width,
+                debug_height,
                 frame_number,
             )
             if self.debug_face_overlay:
                 user_data.set_frame(debug_frame)
             if debug_due:
+                if self.debug_face_overlay and self.debug_stream_width:
+                    debug_frame = self._prepare_debug_frame(debug_frame)
                 if self.rtsp_debug is not None:
                     self.rtsp_debug.submit(debug_frame)
                 else:

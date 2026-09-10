@@ -25,7 +25,7 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --disable-sync --disable-local-display \
   --debug-stream-transport rtsp \
   --debug-rtsp-url rtsp://127.0.0.1:8554/debug_rpi5 \
-  --debug-stream-fps 30 --debug-bitrate 2000 \
+  --debug-stream-fps 8 --debug-stream-width 960 --debug-bitrate 1200 \
   --exit-recognition-zone-file hailo_apps/my_projects/auto_face_id/exit_recognition_zone.txt
 
 python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
@@ -35,7 +35,7 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
   --disable-sync --disable-local-display \
   --debug-stream-transport rtsp \
   --debug-rtsp-url rtsp://127.0.0.1:8554/debug_zero \
-  --debug-stream-fps 30 --debug-bitrate 2000 \
+  --debug-stream-fps 8 --debug-stream-width 960 --debug-bitrate 1200 \
   --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt
 ```
 
@@ -60,8 +60,11 @@ RTSP напрямую в HTML `<img>` не работает. Для старог
 - JPEG debug ранее кодировался синхронно в callback. RTSP использует отдельный
   поток и FFmpeg/libx264 ultrafast/zerolatency, максимум два потока кодировщика.
 - Debug рисуется и отправляется только с заданной частотой, по умолчанию 10 FPS.
-  Разрешение debug соответствует кадру обработки (`--width/--height`), а `/cam`
-  сохраняет исходное разрешение. Увеличение разрешения обработки стоит CPU.
+  `--debug-stream-width 960` ограничивает ширину debug, сохраняя пропорции
+  (1920×1080 → 960×540). По умолчанию 0: исходный размер, увеличения нет.
+  Размер кадра распознавания и сохраняемых снимков не меняется. В headless-режиме
+  уменьшение выполняется до отрисовки; H.264 кодируется уже в меньшем размере.
+  Для начала используйте 8 FPS и 1200 кбит/с; фактический выигрыш измерьте на Pi.
 - Есть только один ожидающий кадр. При зависшем выводе запись прерывается через
   секунду, FFmpeg перезапускается с паузой 2 секунды. Распознавание не ждёт сеть.
 - RTSP читает по TCP с jitter-buffer 100 мс (`--rtsp-latency-ms`). Очередь перед
