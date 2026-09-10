@@ -898,6 +898,19 @@ reid_multisource: &reid_multisource_app
         - name: arcface_mobilefacenet
           source: mz
 
+# Whole-person ReID used by my_projects/auto_face_id/person_body_id.py.
+# The post-process library expects the 512D fc1 output from this exact model.
+person_body_id:
+  models:
+    hailo8:
+      default: None
+    hailo8l:
+      default: None
+    hailo10h:
+      default:
+        - name: repvgg_a0_person_reid_512
+          source: mz
+
 # Multisource pipeline uses detection models
 multisource: *detection_app
 

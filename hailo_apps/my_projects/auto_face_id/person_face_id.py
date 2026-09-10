@@ -590,10 +590,17 @@ class PersonFaceIdApp(GStreamerApp):
         self.tracker = HailoTracker.get_instance()
 
         # Persistent storage layout for the SQLite database and saved images.
+        database_name = Path(self.options_menu.database_name).name
+        if database_name != self.options_menu.database_name:
+            raise ValueError("--database-name must be a file name, not a path")
+        samples_path = Path(self.options_menu.samples_directory)
+        if not samples_path.is_absolute():
+            samples_path = PROJECT_DIR / samples_path
         DATABASE_DIR.mkdir(parents=True, exist_ok=True)
-        SAMPLES_DIR.mkdir(parents=True, exist_ok=True)
+        samples_path.mkdir(parents=True, exist_ok=True)
         self.database_dir = DATABASE_DIR
-        self.samples_dir = SAMPLES_DIR
+        self.database_name = database_name
+        self.samples_dir = samples_path
 
         # Resolve model files and native post-processing libraries once during
         # startup; the pipeline builder only consumes the resolved paths.
@@ -605,6 +612,99 @@ class PersonFaceIdApp(GStreamerApp):
         if self.person_hef_path is None:
             raise RuntimeError("Failed to resolve person detection HEF.")
 
+        self.person_labels_json = get_hef_labels_json(self.person_hef_path)
+        self.person_post_process_so = get_resource_path(
+            pipeline_name=None,
+            resource_type=RESOURCES_SO_DIR_NAME,
+            arch=self.arch,
+            model=DETECTION_POSTPROCESS_SO_FILENAME,
+        )
+        self._resolve_identity_pipeline_resources()
+
+        self.person_post_function_name = DETECTION_POSTPROCESS_FUNCTION
+
+        # Detection thresholds are passed as a single string because the shared
+        # Hailo helper pipeline expects additional hailofilter params in that form.
+        self.person_thresholds_str = (
+            "nms-score-threshold=0.3 "
+            "nms-iou-threshold=0.45 "
+            "output-format-type=HAILO_FORMAT_TYPE_FLOAT32"
+        )
+
+        # Database handler owns persistent people, samples, visits, and movement events.
+        self.db_handler = SQLiteDatabaseHandler(
+            db_name=self.database_name,
+            threshold=0.55,
+            database_dir=str(self.database_dir),
+            samples_dir=str(self.samples_dir),
+        )
+
+        # Runtime identity maps are keyed by Hailo person track_id. Track IDs are
+        # short-lived camera-session IDs; global_id is the persistent DB identity.
+        self.pending_unknowns: dict[int, PendingIdentity] = {}
+        self.known_track_last_sample_frame: dict[int, int] = {}
+        self.person_track_last_seen_frame: dict[int, int] = {}
+        self.identity_track_max_gap_frames = max(
+            1,
+            self.options_menu.identity_track_max_gap_frames,
+        )
+        self.face_track_embeddings: dict[int, np.ndarray] = {}
+        self.track_to_global_id: dict[int, str] = {}
+        self.track_to_label: dict[int, str] = {}
+        self.last_printed_identity: dict[int, str] = {}
+        self.recognition_stats = self._new_recognition_stats()
+        self.entered_people: list[dict] = []
+        self.entered_people_by_global_id: dict[str, dict] = {}
+        self.pending_entry_contexts: dict[int, PendingEntryContext] = {}
+        self._load_entered_people()
+        self.next_person_index = self._load_next_person_index()
+
+        # GStreamerApp calls this for the identity_callback element.
+        self.app_callback = self.pipeline_callback
+
+        logger.info("Person-face database: %s", self.database_dir / self.database_name)
+        logger.info("Person-face samples: %s", self.samples_dir)
+        logger.info("Camera mode: %s", self.camera_mode.value)
+        logger.info("Person-face database records: %d", len(self.db_handler.get_all_records()))
+        logger.info("Loaded entered_people records: %d", len(self.entered_people))
+        if self.entry_counter_enabled:
+            logger.info(
+                "Entry counter enabled: A=%s B=%s margin=%.3f",
+                self.entry_detector.line_a,
+                self.entry_detector.line_b,
+                self.entry_detector.margin,
+            )
+        if self.exit_counter_enabled:
+            logger.info(
+                "Exit counter enabled: A=%s B=%s margin=%.3f",
+                self.exit_detector.line_a,
+                self.exit_detector.line_b,
+                self.exit_detector.margin,
+            )
+
+        if self.options_menu.disable_local_display:
+            self.video_sink = "fakesink"
+
+        if self.debug_stream_enabled and self.options_menu.debug_stream_transport == "http":
+            self._start_debug_stream_server()
+
+        self.create_pipeline()
+        self._connect_face_embedding_callback()
+        if self.debug_stream_enabled and self.options_menu.debug_stream_transport == "rtsp":
+            if self.options_menu.debug_rtsp_url == self.video_source:
+                raise ValueError("Input and debug RTSP URLs must differ")
+            self.rtsp_debug = RtspDebugPublisher(
+                self.options_menu.debug_rtsp_url,
+                self.options_menu.debug_stream_fps,
+                self.options_menu.debug_bitrate,
+            )
+
+    def _resolve_identity_pipeline_resources(self) -> None:
+        """Resolve face-specific models and post-processors.
+
+        A separate body-ReID application overrides this hook so it does not
+        download or require either face model.
+        """
         face_models = resolve_hef_paths(
             self.options_menu.face_hef_path,
             app_name=FACE_RECOGNITION_PIPELINE,
@@ -612,20 +712,11 @@ class PersonFaceIdApp(GStreamerApp):
         )
         self.face_detection_hef_path = face_models[0].path
         self.face_recognition_hef_path = face_models[1].path
-
-        self.person_labels_json = get_hef_labels_json(self.person_hef_path)
         self.face_labels_json = get_resource_path(
             pipeline_name=None,
             resource_type=RESOURCES_JSON_DIR_NAME,
             arch=self.arch,
             model=FACE_DETECTION_JSON_NAME,
-        )
-
-        self.person_post_process_so = get_resource_path(
-            pipeline_name=None,
-            resource_type=RESOURCES_SO_DIR_NAME,
-            arch=self.arch,
-            model=DETECTION_POSTPROCESS_SO_FILENAME,
         )
         self.face_post_process_so = get_resource_path(
             pipeline_name=None,
@@ -665,86 +756,9 @@ class PersonFaceIdApp(GStreamerApp):
         else:
             raise RuntimeError(f"Unsupported Hailo architecture: {self.arch}")
 
-        self.person_post_function_name = DETECTION_POSTPROCESS_FUNCTION
         self.face_recognition_post_function_name = ARCFACE_MOBILEFACENET_POSTPROCESS_FUNCTION
         self.person_cropper_function_name = CLIP_CROPPER_OBJECT_POSTPROCESS_FUNCTION_NAME
         self.face_cropper_function_name = "face_recognition"
-
-        # Detection thresholds are passed as a single string because the shared
-        # Hailo helper pipeline expects additional hailofilter params in that form.
-        self.person_thresholds_str = (
-            "nms-score-threshold=0.3 "
-            "nms-iou-threshold=0.45 "
-            "output-format-type=HAILO_FORMAT_TYPE_FLOAT32"
-        )
-
-        # Database handler owns persistent people, samples, visits, and movement events.
-        self.db_handler = SQLiteDatabaseHandler(
-            db_name=DB_NAME,
-            threshold=0.55,
-            database_dir=str(self.database_dir),
-            samples_dir=str(self.samples_dir),
-        )
-
-        # Runtime identity maps are keyed by Hailo person track_id. Track IDs are
-        # short-lived camera-session IDs; global_id is the persistent DB identity.
-        self.pending_unknowns: dict[int, PendingIdentity] = {}
-        self.known_track_last_sample_frame: dict[int, int] = {}
-        self.person_track_last_seen_frame: dict[int, int] = {}
-        self.identity_track_max_gap_frames = max(
-            1,
-            self.options_menu.identity_track_max_gap_frames,
-        )
-        self.face_track_embeddings: dict[int, np.ndarray] = {}
-        self.track_to_global_id: dict[int, str] = {}
-        self.track_to_label: dict[int, str] = {}
-        self.last_printed_identity: dict[int, str] = {}
-        self.recognition_stats = self._new_recognition_stats()
-        self.entered_people: list[dict] = []
-        self.entered_people_by_global_id: dict[str, dict] = {}
-        self.pending_entry_contexts: dict[int, PendingEntryContext] = {}
-        self._load_entered_people()
-        self.next_person_index = self._load_next_person_index()
-
-        # GStreamerApp calls this for the identity_callback element.
-        self.app_callback = self.pipeline_callback
-
-        logger.info("Person-face database: %s", self.database_dir / DB_NAME)
-        logger.info("Person-face samples: %s", self.samples_dir)
-        logger.info("Camera mode: %s", self.camera_mode.value)
-        logger.info("Person-face database records: %d", len(self.db_handler.get_all_records()))
-        logger.info("Loaded entered_people records: %d", len(self.entered_people))
-        if self.entry_counter_enabled:
-            logger.info(
-                "Entry counter enabled: A=%s B=%s margin=%.3f",
-                self.entry_detector.line_a,
-                self.entry_detector.line_b,
-                self.entry_detector.margin,
-            )
-        if self.exit_counter_enabled:
-            logger.info(
-                "Exit counter enabled: A=%s B=%s margin=%.3f",
-                self.exit_detector.line_a,
-                self.exit_detector.line_b,
-                self.exit_detector.margin,
-            )
-
-        if self.options_menu.disable_local_display:
-            self.video_sink = "fakesink"
-
-        if self.debug_stream_enabled and self.options_menu.debug_stream_transport == "http":
-            self._start_debug_stream_server()
-
-        self.create_pipeline()
-        self._connect_face_embedding_callback()
-        if self.debug_stream_enabled and self.options_menu.debug_stream_transport == "rtsp":
-            if self.options_menu.debug_rtsp_url == self.video_source:
-                raise ValueError("Input and debug RTSP URLs must differ")
-            self.rtsp_debug = RtspDebugPublisher(
-                self.options_menu.debug_rtsp_url,
-                self.options_menu.debug_stream_fps,
-                self.options_menu.debug_bitrate,
-            )
 
     # ------------------------------------------------------------------
     # CLI and live configuration
@@ -775,6 +789,16 @@ class PersonFaceIdApp(GStreamerApp):
                 "Path or model name for the face detection and face recognition HEFs. "
                 "Provide two values if overriding the defaults."
             ),
+        )
+        parser.add_argument(
+            "--database-name",
+            default=DB_NAME,
+            help="SQLite file name inside the project database directory.",
+        )
+        parser.add_argument(
+            "--samples-directory",
+            default=SAMPLES_DIR.name,
+            help="Sample directory, absolute or relative to this application directory.",
         )
         parser.add_argument(
             "--camera-mode",

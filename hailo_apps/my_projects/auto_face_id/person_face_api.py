@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -33,8 +34,8 @@ except ImportError:
 
 PROJECT_DIR = Path(__file__).resolve().parent
 DATABASE_DIR = PROJECT_DIR / "database"
-SAMPLES_DIR = PROJECT_DIR / "samples"
-DB_NAME = "persons.sqlite3"
+SAMPLES_DIR = PROJECT_DIR / os.getenv("PERSON_ID_SAMPLES_DIR", "samples")
+DB_NAME = Path(os.getenv("PERSON_ID_DB_NAME", "persons.sqlite3")).name
 
 logger = logging.getLogger(__name__)
 

@@ -256,6 +256,69 @@ Placeholder продолжает принимать embeddings текущего 
 в оперативной памяти и не переживает остановку процесса; повторов при ошибках
 диска это изменение не добавляет.
 
+### Whole-person ReID на Hailo-10H
+
+`person_body_id.py` использует рамку всего человека и модель
+`repvgg_a0_person_reid_512`; детекция и распознавание лица в этом процессе не
+запускаются. На ENTRY каждый новый трек создаёт новую запись после A → B, без
+поиска по истории. На EXIT выбирается наиболее похожая запись только среди людей
+со статусом «внутри», а решение подтверждается несколькими embeddings.
+
+Body embeddings несовместимы с face embeddings, поэтому приложение по умолчанию
+использует отдельные `database/persons_body.sqlite3` и `body_samples/`. Обе камеры
+и API должны работать с этими же путями.
+
+Отдельный API для body-режима экспортирует те же HTTP-маршруты, схемы ответов,
+`POST /api/events` и WebSocket `/ws`, что и `person_face_api.py`. Поэтому во
+frontend нужно поменять только адрес backend, если он запускается на другом
+хосте или порту:
+
+```bash
+python3 hailo_apps/my_projects/auto_face_id/person_body_api.py \
+  --host 127.0.0.1 --port 8000
+```
+
+EXIT:
+
+```bash
+python3 hailo_apps/my_projects/auto_face_id/person_body_id.py \
+  --camera-mode exit \
+  --input rtsp://127.0.0.1:8554/cam \
+  --width 1920 --height 1080 --frame-rate 15 \
+  --disable-sync --disable-local-display \
+  --debug-stream-transport rtsp \
+  --debug-rtsp-url rtsp://127.0.0.1:8554/debug_rpi5 \
+  --debug-stream-fps 8 --debug-stream-width 960 --debug-bitrate 1200 \
+  --notify-url http://127.0.0.1:8000/api/events \
+  --recognition-vote-window 5 --recognition-vote-threshold 3 \
+  --identity-track-max-gap-frames 25 \
+  --exit-recognition-zone-file hailo_apps/my_projects/auto_face_id/exit_recognition_zone.txt
+```
+
+ENTRY:
+
+```bash
+python3 hailo_apps/my_projects/auto_face_id/person_body_id.py \
+  --camera-mode entry \
+  --input rtsp://192.168.0.3:8554/cam \
+  --width 1920 --height 1080 --frame-rate 15 \
+  --disable-sync --disable-local-display \
+  --debug-stream-transport rtsp \
+  --debug-rtsp-url rtsp://127.0.0.1:8554/debug_zero \
+  --debug-stream-fps 8 --debug-stream-width 960 --debug-bitrate 1200 \
+  --notify-url http://127.0.0.1:8000/api/events \
+  --unknown-sample-interval 1 --max-pending-embeddings 10 \
+  --identity-track-max-gap-frames 25 \
+  --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt
+```
+
+При первом запуске HEF для Hailo-10H скачивается из каталога Model Zoo. При
+плохой связи его можно заранее положить локально и передать явно:
+
+```bash
+--person-reid-hef-path /absolute/path/repvgg_a0_person_reid_512.hef
+```
+
 
 ### Backend: список выходов и обновления
 
