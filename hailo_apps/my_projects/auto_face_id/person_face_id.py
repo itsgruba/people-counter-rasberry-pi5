@@ -173,6 +173,8 @@ class EntryTrackState:
 
     last_side_a: int | None = None
     last_side_b: int | None = None
+    stable_point_a: tuple[float, float] | None = None
+    stable_point_b: tuple[float, float] | None = None
     stage: str = "outside"
     crossed_a_frame: int | None = None
     crossed_a_at: int | None = None
@@ -211,6 +213,8 @@ class EntryDetector:
     ) -> None:
         self.line_a_y = line_a_y
         self.line_b_y = line_b_y
+        self.line_a = ((0.0, line_a_y), (1.0, line_a_y))
+        self.line_b = ((0.0, line_b_y), (1.0, line_b_y))
         self.margin = max(0.0, margin)
         self.track_ttl_seconds = max(0.0, track_ttl_seconds)
         self.min_frames_between_lines = max(0, min_frames_between_lines)
@@ -244,18 +248,30 @@ class EntryDetector:
         return previous_side, False
 
     @staticmethod
-    def _line_cross_order(
-        previous_y: float,
-        current_y: float,
-        first_line_y: float,
-        second_line_y: float,
-    ) -> bool:
-        delta_y = current_y - previous_y
-        if abs(delta_y) <= 1e-12:
-            return True
-        first_t = (first_line_y - previous_y) / delta_y
-        second_t = (second_line_y - previous_y) / delta_y
-        return first_t <= second_t
+    def _distance(point, line) -> float:
+        (x1, y1), (x2, y2) = line
+        dx, dy = x2 - x1, y2 - y1
+        return (dx * (point[1] - y1) - dy * (point[0] - x1)) / (dx * dx + dy * dy) ** 0.5
+
+    def _cross_segment(self, state, name, point):
+        line = getattr(self, f"line_{name}")
+        previous = getattr(state, f"stable_point_{name}")
+        side, crossed = self._update_side(
+            getattr(state, f"last_side_{name}"), self._distance(point, line), 0.0
+        )
+        crossing_point = None
+        if crossed and previous is not None:
+            d0, d1 = self._distance(previous, line), self._distance(point, line)
+            t = d0 / (d0 - d1)
+            crossing_point = tuple(previous[i] + t * (point[i] - previous[i]) for i in (0, 1))
+            (x1, y1), (x2, y2) = line
+            dx, dy = x2 - x1, y2 - y1
+            projection = ((crossing_point[0] - x1) * dx + (crossing_point[1] - y1) * dy) / (dx * dx + dy * dy)
+            crossed = -1e-9 <= projection <= 1.0 + 1e-9
+        setattr(state, f"last_side_{name}", side)
+        if abs(self._distance(point, line)) > self.margin:
+            setattr(state, f"stable_point_{name}", point)
+        return crossed, crossing_point
 
     def update(
         self,
@@ -276,18 +292,14 @@ class EntryDetector:
         # Each line has a small dead zone (margin). The side only changes when
         # the anchor point moves clearly past the line, which prevents jitter
         # around the line from creating duplicate events.
-        new_side_a, crossed_a = self._update_side(state.last_side_a, point[1], self.line_a_y)
-        new_side_b, crossed_b = self._update_side(state.last_side_b, point[1], self.line_b_y)
-        state.last_side_a = new_side_a
-        state.last_side_b = new_side_b
+        crossed_a, crossing_a = self._cross_segment(state, "a", point)
+        crossed_b, crossing_b = self._cross_segment(state, "b", point)
         crossed_a_before_b = True
         if crossed_a and crossed_b and previous_point is not None:
-            crossed_a_before_b = self._line_cross_order(
-                previous_point[1],
-                point[1],
-                self.line_a_y,
-                self.line_b_y,
-            )
+            direction = (point[0] - previous_point[0], point[1] - previous_point[1])
+            crossed_a_before_b = sum(
+                (crossing_b[i] - crossing_a[i]) * direction[i] for i in (0, 1)
+            ) >= 0
 
         if crossed_a and state.stage != "entered":
             state.stage = "crossed_a"
@@ -295,7 +307,7 @@ class EntryDetector:
             state.crossed_a_at = timestamp
 
         # A valid entry is only A -> B. If both lines are crossed in one frame,
-        # _line_cross_order uses the previous and current anchor positions to
+        # the previous and current anchor positions are used to
         # keep the order deterministic.
         enough_frames = (
             state.crossed_a_frame is not None
@@ -689,16 +701,16 @@ class PersonFaceIdApp(GStreamerApp):
         logger.info("Loaded entered_people records: %d", len(self.entered_people))
         if self.entry_counter_enabled:
             logger.info(
-                "Entry counter enabled: line_a_y=%.3f line_b_y=%.3f margin=%.3f",
-                self.entry_detector.line_a_y,
-                self.entry_detector.line_b_y,
+                "Entry counter enabled: A=%s B=%s margin=%.3f",
+                self.entry_detector.line_a,
+                self.entry_detector.line_b,
                 self.entry_detector.margin,
             )
         if self.exit_counter_enabled:
             logger.info(
-                "Exit counter enabled: line_a_y=%.3f line_b_y=%.3f margin=%.3f",
-                self.exit_detector.line_a_y,
-                self.exit_detector.line_b_y,
+                "Exit counter enabled: A=%s B=%s margin=%.3f",
+                self.exit_detector.line_a,
+                self.exit_detector.line_b,
                 self.exit_detector.margin,
             )
 
@@ -968,7 +980,7 @@ class PersonFaceIdApp(GStreamerApp):
             default=None,
             help=(
                 "Optional text file reloaded while the app is running. Supports "
-                "entry_line_a_y=0.55, entry_line_b_y=0.75, entry_line_margin=0.02. "
+                "entry_line_a=x1,y1,x2,y2, entry_line_b=x1,y1,x2,y2, entry_line_margin=0.02. "
                 "If omitted, the app also looks for those keys in --enroll-zone-file."
             ),
         )
@@ -1011,8 +1023,9 @@ class PersonFaceIdApp(GStreamerApp):
             "--exit-lines-file",
             default=None,
             help=(
-                "Optional text file reloaded while running. Supports exit_line_a_y, "
-                "exit_line_b_y and exit_line_margin. If omitted, the app also looks "
+                "Optional text file reloaded while running. Supports exit_line_a=x1,y1,x2,y2, "
+                "exit_line_b=x1,y1,x2,y2 and exit_line_margin. Legacy *_y keys remain supported. "
+                "If omitted, the app also looks "
                 "for these keys in --exit-recognition-zone-file."
             ),
         )
@@ -1182,13 +1195,17 @@ class PersonFaceIdApp(GStreamerApp):
     @staticmethod
     def _read_enroll_zone_file(path: Path) -> str | None:
         for raw_line in path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
+            line = raw_line.split("#", 1)[0].strip()
             if not line or line.startswith("#"):
                 continue
             if "=" in line:
                 key, value = line.split("=", 1)
                 key = key.strip().lower().replace("-", "_")
                 if key in {
+                    "entry_line_a", "entry_line_b",
+                    "exit_line_a", "exit_line_b",
+                    "line_a", "line_b", "a", "b",
+                    "line_a_y", "line_b_y", "margin", "line_margin",
                     "entry_line_a_y",
                     "entry_line_b_y",
                     "entry_line_margin",
@@ -1202,72 +1219,71 @@ class PersonFaceIdApp(GStreamerApp):
         return None
 
     @staticmethod
-    def _read_entry_lines_file(path: Path) -> dict[str, float] | None:
-        values: dict[str, float] = {}
-        aliases = {
-            "entry_line_a_y": "entry_line_a_y",
-            "line_a_y": "entry_line_a_y",
-            "line_a": "entry_line_a_y",
-            "a": "entry_line_a_y",
-            "entry_line_b_y": "entry_line_b_y",
-            "line_b_y": "entry_line_b_y",
-            "line_b": "entry_line_b_y",
-            "b": "entry_line_b_y",
-            "entry_line_margin": "entry_line_margin",
-            "line_margin": "entry_line_margin",
-            "margin": "entry_line_margin",
-        }
-
+    def _read_crossing_lines_file(path: Path, prefix: str) -> dict | None:
+        values = {}
+        aliases = {"margin": f"{prefix}_line_margin", "line_margin": f"{prefix}_line_margin"}
+        for name in ("a", "b"):
+            for key in (name, f"line_{name}", f"{prefix}_line_{name}"):
+                aliases[key] = f"{prefix}_line_{name}"
+            for key in (f"line_{name}_y", f"{prefix}_line_{name}_y"):
+                aliases[key] = f"{prefix}_line_{name}"
+        aliases[f"{prefix}_line_margin"] = f"{prefix}_line_margin"
         for raw_line in path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#"):
+            line = raw_line.split("#", 1)[0].strip()
+            if not line:
                 continue
-            if "=" in line:
-                key, raw_value = line.split("=", 1)
-                key = key.strip().lower().replace("-", "_")
-                target_key = aliases.get(key)
-                if target_key is None:
-                    continue
-                values[target_key] = float(raw_value.strip())
+            if "=" not in line:
+                parts = line.split(",")
+                if prefix == "entry" and 2 <= len(parts) <= 3:
+                    for name, value in zip(("a", "b"), parts):
+                        y = float(value)
+                        values[f"{prefix}_line_{name}"] = ((0.0, y), (1.0, y))
+                    if len(parts) == 3:
+                        values[f"{prefix}_line_margin"] = float(parts[2])
                 continue
-
-            try:
-                coordinates = [float(part.strip()) for part in line.split(",")]
-            except ValueError:
+            key, raw_value = line.split("=", 1)
+            target = aliases.get(key.strip().lower().replace("-", "_"))
+            if target is None:
                 continue
-            if 2 <= len(coordinates) <= 3:
-                values["entry_line_a_y"] = coordinates[0]
-                values["entry_line_b_y"] = coordinates[1]
-                if len(coordinates) == 3:
-                    values["entry_line_margin"] = coordinates[2]
-
+            coordinates = [float(part.strip()) for part in raw_value.split(",")]
+            if target.endswith("margin"):
+                if len(coordinates) != 1:
+                    raise ValueError("Line margin requires one number")
+                values[target] = coordinates[0]
+            elif len(coordinates) == 1:
+                values[target] = ((0.0, coordinates[0]), (1.0, coordinates[0]))
+            elif len(coordinates) == 4:
+                values[target] = (tuple(coordinates[:2]), tuple(coordinates[2:]))
+            else:
+                raise ValueError(f"{key} requires x1,y1,x2,y2 or a legacy Y value")
         return values or None
 
     @staticmethod
-    def _read_exit_lines_file(path: Path) -> dict[str, float] | None:
-        values: dict[str, float] = {}
-        aliases = {
-            "exit_line_a_y": "exit_line_a_y",
-            "line_a_y": "exit_line_a_y",
-            "line_a": "exit_line_a_y",
-            "a": "exit_line_a_y",
-            "exit_line_b_y": "exit_line_b_y",
-            "line_b_y": "exit_line_b_y",
-            "line_b": "exit_line_b_y",
-            "b": "exit_line_b_y",
-            "exit_line_margin": "exit_line_margin",
-            "line_margin": "exit_line_margin",
-            "margin": "exit_line_margin",
-        }
-        for raw_line in path.read_text(encoding="utf-8").splitlines():
-            line = raw_line.strip()
-            if not line or line.startswith("#") or "=" not in line:
-                continue
-            key, raw_value = line.split("=", 1)
-            target_key = aliases.get(key.strip().lower().replace("-", "_"))
-            if target_key is not None:
-                values[target_key] = float(raw_value.strip())
-        return values or None
+    def _read_entry_lines_file(path: Path) -> dict | None:
+        return PersonFaceIdApp._read_crossing_lines_file(path, "entry")
+
+    @staticmethod
+    def _read_exit_lines_file(path: Path) -> dict | None:
+        return PersonFaceIdApp._read_crossing_lines_file(path, "exit")
+
+    @staticmethod
+    def _apply_crossing_lines(detector, values, prefix):
+        line_a = values.get(f"{prefix}_line_a", detector.line_a)
+        line_b = values.get(f"{prefix}_line_b", detector.line_b)
+        margin = values.get(f"{prefix}_line_margin", detector.margin)
+        for line in (line_a, line_b):
+            if any(not 0.0 <= value <= 1.0 for point in line for value in point):
+                raise ValueError("Line coordinates must be finite and within [0, 1]")
+            if line[0] == line[1]:
+                raise ValueError("A line requires two distinct points")
+        if all(abs(detector._distance(point, line_a)) < 1e-9 for point in line_b):
+            raise ValueError("Lines A and B must not be collinear")
+        if not 0.0 <= margin <= 1.0:
+            raise ValueError("Line margin must be within [0, 1]")
+        if (line_a, line_b, margin) != (detector.line_a, detector.line_b, detector.margin):
+            detector.tracks.clear()
+        detector.line_a, detector.line_b, detector.margin = line_a, line_b, margin
+        detector.line_a_y, detector.line_b_y = line_a[0][1], line_b[0][1]
 
     def _reload_enroll_zone_file(self, force: bool = False) -> None:
         if self.enroll_zone_file is None:
@@ -1350,20 +1366,10 @@ class PersonFaceIdApp(GStreamerApp):
             if not values:
                 return
 
-            line_a_y = values.get("entry_line_a_y", self.entry_detector.line_a_y)
-            line_b_y = values.get("entry_line_b_y", self.entry_detector.line_b_y)
-            margin = values.get("entry_line_margin", self.entry_detector.margin)
-            self._validate_entry_values(line_a_y, line_b_y, margin)
-            self.entry_detector.line_a_y = line_a_y
-            self.entry_detector.line_b_y = line_b_y
-            self.entry_detector.margin = margin
-            logger.info(
-                "Reloaded entry lines from %s: line_a_y=%.3f line_b_y=%.3f margin=%.3f",
-                self.entry_lines_file,
-                line_a_y,
-                line_b_y,
-                margin,
-            )
+            self._apply_crossing_lines(self.entry_detector, values, "entry")
+            logger.info("Reloaded entry lines from %s: A=%s B=%s margin=%.3f",
+                        self.entry_lines_file, self.entry_detector.line_a,
+                        self.entry_detector.line_b, self.entry_detector.margin)
         except (OSError, ValueError) as exc:
             self._entry_lines_file_mtime = mtime
             logger.warning(
@@ -1389,20 +1395,10 @@ class PersonFaceIdApp(GStreamerApp):
             self._exit_lines_file_mtime = mtime
             if not values:
                 return
-            line_a_y = values.get("exit_line_a_y", self.exit_detector.line_a_y)
-            line_b_y = values.get("exit_line_b_y", self.exit_detector.line_b_y)
-            margin = values.get("exit_line_margin", self.exit_detector.margin)
-            self._validate_crossing_values(line_a_y, line_b_y, margin, "exit")
-            self.exit_detector.line_a_y = line_a_y
-            self.exit_detector.line_b_y = line_b_y
-            self.exit_detector.margin = margin
-            logger.info(
-                "Reloaded exit lines from %s: line_a_y=%.3f line_b_y=%.3f margin=%.3f",
-                self.exit_lines_file,
-                line_a_y,
-                line_b_y,
-                margin,
-            )
+            self._apply_crossing_lines(self.exit_detector, values, "exit")
+            logger.info("Reloaded exit lines from %s: A=%s B=%s margin=%.3f",
+                        self.exit_lines_file, self.exit_detector.line_a,
+                        self.exit_detector.line_b, self.exit_detector.margin)
         except (OSError, ValueError) as exc:
             self._exit_lines_file_mtime = mtime
             logger.warning(
@@ -2392,7 +2388,7 @@ class PersonFaceIdApp(GStreamerApp):
 
         points = np.array(
             [
-                (int(x * width), int(y * height))
+                (int(x * (width - 1)), int(y * (height - 1)))
                 for x, y in zone
             ],
             dtype=np.int32,
@@ -2506,16 +2502,19 @@ class PersonFaceIdApp(GStreamerApp):
             return
 
         lines = [
-            ("A", self.entry_detector.line_a_y, (70, 180, 255)),
-            ("B", self.entry_detector.line_b_y, (255, 210, 70)),
+            ("A", self.entry_detector.line_a, (70, 180, 255)),
+            ("B", self.entry_detector.line_b, (255, 210, 70)),
         ]
-        for name, y_norm, color in lines:
-            y = int(max(0.0, min(y_norm, 1.0)) * height)
-            cv2.line(frame, (0, y), (width - 1, y), color, 2)
+        for name, line, color in lines:
+            start, end = [(int(x * (width - 1)), int(y * (height - 1))) for x, y in line]
+            y = start[1]
+            cv2.line(frame, start, end, color, 2)
+            cv2.circle(frame, start, 4, color, -1)
+            cv2.circle(frame, end, 4, color, -1)
             cv2.putText(
                 frame,
                 f"LINE {name}",
-                (12, max(18, y - 8)),
+                (max(8, min(width - 100, start[0] + 8)), max(18, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 color,
@@ -2527,16 +2526,19 @@ class PersonFaceIdApp(GStreamerApp):
         if not self.exit_counter_enabled:
             return
         lines = [
-            ("EXIT A", self.exit_detector.line_a_y, (190, 80, 255)),
-            ("EXIT B", self.exit_detector.line_b_y, (80, 220, 255)),
+            ("EXIT A", self.exit_detector.line_a, (190, 80, 255)),
+            ("EXIT B", self.exit_detector.line_b, (80, 220, 255)),
         ]
-        for name, y_norm, color in lines:
-            y = int(max(0.0, min(y_norm, 1.0)) * height)
-            cv2.line(frame, (0, y), (width - 1, y), color, 2)
+        for name, line, color in lines:
+            start, end = [(int(x * (width - 1)), int(y * (height - 1))) for x, y in line]
+            y = start[1]
+            cv2.line(frame, start, end, color, 2)
+            cv2.circle(frame, start, 4, color, -1)
+            cv2.circle(frame, end, 4, color, -1)
             cv2.putText(
                 frame,
                 name,
-                (12, max(18, y - 8)),
+                (max(8, min(width - 100, start[0] + 8)), max(18, y - 8)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.55,
                 color,
@@ -2622,10 +2624,6 @@ class PersonFaceIdApp(GStreamerApp):
         height: int,
         frame_number: int,
     ) -> None:
-        self._draw_active_recognition_zone(frame, width, height)
-        self._draw_entry_lines(frame, width, height)
-        self._draw_exit_lines(frame, width, height)
-
         for person_detection in person_detections:
             track_id = self._get_track_id(person_detection)
             if track_id is None:
@@ -2662,6 +2660,11 @@ class PersonFaceIdApp(GStreamerApp):
                 label,
                 color=(40, 220, 90),
             )
+
+        # Keep zone outlines visible above detection boxes and their filled labels.
+        self._draw_active_recognition_zone(frame, width, height)
+        self._draw_entry_lines(frame, width, height)
+        self._draw_exit_lines(frame, width, height)
 
         if not self.debug_show_stats:
             return
