@@ -5,7 +5,7 @@
 
 # Lines are normalized segments: x1,y1,x2,y2.
 # The app counts entered when the same person_track_id crosses A and then B.
-entry_line_a=0.0,0.75,1.0,0.75
-entry_line_b=0.0,0.95,1.0,0.95
+entry_line_a=0.3,0.68,0.6,0.75
+entry_line_b=0.05,0.8,0.5,0.95
 
 entry_line_margin=0.02
