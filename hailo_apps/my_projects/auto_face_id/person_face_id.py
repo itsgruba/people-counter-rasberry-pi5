@@ -7,7 +7,7 @@ High-level flow:
 2. Face embeddings are cached by face track ID.
 3. GStreamer/Hailo detects and tracks persons.
 4. Every face is matched back to the containing person box.
-5. The person track is recognized, enrolled as a new person, or left pending.
+5. ENTRY collects a fresh identity without searching remembered faces; EXIT matches inside people.
 6. ENTRY adds a person after A -> B; EXIT removes the recognized person after A -> B.
 
 The file is intentionally split into sections below. When adding a second camera,
@@ -192,6 +192,7 @@ class PendingEntryContext:
     """Runtime context for an A -> B entry waiting for identity resolution."""
 
     event: LineCrossingEvent
+    snapshot: np.ndarray | None = None
     created_at: float = field(default_factory=time.time)
 
 
@@ -1771,9 +1772,10 @@ class PersonFaceIdApp(GStreamerApp):
         width: int | None,
         height: int | None,
         record_legacy_visit: bool = False,
+        snapshot: np.ndarray | None = None,
     ) -> None:
         """Save one entry/exit photo and link it to the person."""
-        if frame is None or person_detection is None or width is None or height is None:
+        if snapshot is None and (frame is None or person_detection is None or width is None or height is None):
             logger.warning(
                 "%s event for %s had no frame available for a snapshot.",
                 event_type,
@@ -1792,6 +1794,7 @@ class PersonFaceIdApp(GStreamerApp):
             detection=person_detection,
             width=width,
             height=height,
+            snapshot=snapshot,
         )
         self.db_handler.add_visit_event(
             global_id=person["global_id"],
@@ -2049,8 +2052,15 @@ class PersonFaceIdApp(GStreamerApp):
         label = self.track_to_label.get(event.track_id, "Unknown")
         global_id = self.track_to_global_id.get(event.track_id)
         if global_id is None:
+            snapshot = None
+            if frame is not None and person_detection is not None and width is not None and height is not None:
+                cropped = self.crop_frame(frame, person_detection.get_bbox(), width, height)
+                # Own the crossing pixels: Gst may reuse the source buffer while
+                # admission waits for face samples or the timeout.
+                snapshot = (cropped if cropped.size else frame).copy()
             self.pending_entry_contexts[event.track_id] = PendingEntryContext(
                 event=event,
+                snapshot=snapshot,
             )
             print(f"inside-pending: track_id={event.track_id} label=Unknown")
             self._notify_frontend(
@@ -2106,7 +2116,7 @@ class PersonFaceIdApp(GStreamerApp):
             return
 
         self.entry_detector.mark_crossing_counted(track_id, global_id)
-        self.pending_entry_contexts.pop(track_id, None)
+        context = self.pending_entry_contexts.pop(track_id, None)
         self._record_visit_event_snapshot(
             person=record,
             event_type="entry",
@@ -2117,6 +2127,7 @@ class PersonFaceIdApp(GStreamerApp):
             width=width,
             height=height,
             record_legacy_visit=True,
+            snapshot=context.snapshot if context is not None else None,
         )
         self._remember_entered_person(record, timestamp, track_id)
         total_entered = int(record.get("total_entered", 0))
@@ -2940,17 +2951,20 @@ class PersonFaceIdApp(GStreamerApp):
         event_type: str,
         timestamp: int,
         track_id: int,
-        frame: np.ndarray,
+        frame: np.ndarray | None,
         detection,
-        width: int,
-        height: int,
+        width: int | None,
+        height: int | None,
+        snapshot: np.ndarray | None = None,
     ) -> str:
         visit_dir = self._visit_event_sample_dir(label, visit_number, event_type)
         visit_dir.mkdir(parents=True, exist_ok=True)
         image_path = visit_dir / f"snapshot_{timestamp}_track_{track_id}.jpeg"
-        cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
-        if cropped.size == 0:
-            cropped = frame
+        cropped = snapshot
+        if cropped is None:
+            cropped = self.crop_frame(frame, detection.get_bbox(), width, height)
+            if cropped.size == 0:
+                cropped = frame
         self.save_image_file(cropped, str(image_path))
         return str(image_path)
 
@@ -3312,45 +3326,9 @@ class PersonFaceIdApp(GStreamerApp):
         if time.time() - pending.first_seen_time < self.min_unknown_age_seconds:
             return
 
-        stable_vote = self._stable_pending_vote(pending)
-        if stable_vote is not None and self._bind_existing_person_from_vote(
-            track_id,
-            stable_vote,
-            "recognized-by-votes",
-            person_detection,
-            frame,
-            width,
-            height,
-        ):
-            return
-
-        for sample in pending.samples:
-            person, confidence = self._recognize_embedding(sample.embedding)
-            stable_vote = self._record_pending_vote(track_id, person, confidence)
-            if stable_vote is not None and self._bind_existing_person_from_vote(
-                track_id,
-                stable_vote,
-                "recognized-by-samples",
-                person_detection,
-                frame,
-                width,
-                height,
-            ):
-                return
-
-        avg_embedding = np.mean([sample.embedding for sample in pending.samples], axis=0)
-        person, confidence = self._recognize_embedding(avg_embedding)
-        if person["label"] != "Unknown":
-            self._bind_existing_person(
-                track_id,
-                person,
-                confidence,
-                "recognized-after-samples",
-                person_detection,
-                frame,
-                width,
-                height,
-            )
+        # Entry identities belong to one admission, not to a remembered face.
+        # Collect samples before crossing, but only create a record after A -> B.
+        if self.entry_counter_enabled and self.entry_detector.uncounted_crossing(track_id) is None:
             return
 
         label = self._make_person_label()
@@ -3413,6 +3391,9 @@ class PersonFaceIdApp(GStreamerApp):
     ) -> None:
         self._enroll_if_ready(track_id, person_detection, frame, width, height)
         if track_id not in self.pending_unknowns:
+            return
+
+        if len(self.pending_unknowns[track_id].samples) >= self.samples_per_person:
             return
 
         if not self._is_inside_enroll_zone(person_detection, face_detection):
@@ -3712,7 +3693,7 @@ class PersonFaceIdApp(GStreamerApp):
         # 1. Find the person box that contains the face.
         # 2. Get the embedding from the face branch cache or from this ROI.
         # 3. If the person track is already known, reuse the existing identity.
-        # 4. Otherwise vote across recent embeddings before enrolling a new person.
+        # 4. Entry collects a new admission; exit searches only people currently inside.
         stats = self.recognition_stats
         stats["frames"] += 1
         stats["persons"] += len(person_detections)
@@ -3824,36 +3805,9 @@ class PersonFaceIdApp(GStreamerApp):
                 stats["known"] += 1
                 continue
 
-            person, confidence = self._recognize_embedding(embedding_vector)
-            stable_vote = self._record_pending_vote(
-                matched_person_track_id,
-                person,
-                confidence,
-            )
-            if stable_vote is not None and frame is None:
-                frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height)
-            if stable_vote is not None and self._bind_existing_person_from_vote(
-                matched_person_track_id,
-                stable_vote,
-                "recognized-by-votes",
-                matched_person,
-                frame,
-                width,
-                height,
-            ):
-                stats["known"] += 1
-                continue
-
-            if person["label"] != "Unknown":
-                logger.debug(
-                    "Pending recognition vote: track_id=%d global_id=%s label=%s "
-                    "confidence=%.2f",
-                    matched_person_track_id,
-                    person["global_id"],
-                    person["label"],
-                    confidence,
-                )
-                continue
+            # Never search historical identities on entry. Embeddings are collected
+            # only to match this admission against the exit camera later.
+            self.pending_unknowns.setdefault(matched_person_track_id, PendingIdentity())
 
             stats["unknown"] += 1
             if frame is None:
