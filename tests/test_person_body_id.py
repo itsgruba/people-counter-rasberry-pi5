@@ -53,7 +53,7 @@ def test_body_app_does_not_resolve_face_resources():
 
 
 def test_entry_never_searches_historical_identities_and_exit_searches_inside_only():
-    calls = _called_attributes(_method("pipeline_callback"))
+    calls = _called_attributes(_method("_pipeline_callback_impl"))
     assert "_recognize_embedding" not in calls
     assert "_recognize_entered_embedding" in calls
     assert "_handle_unknown_person" in calls
@@ -70,6 +70,19 @@ def test_body_database_is_separate_from_face_embeddings():
     source = ast.unparse(_method("_build_body_parser"))
     assert "persons_body.sqlite3" in source
     assert "body_samples" in source
+    assert "enable_watchdog=True" in source
+
+
+def test_live_errors_and_eos_schedule_recovery_instead_of_shutdown():
+    source = ast.unparse(_method("bus_call"))
+    assert source.count("_schedule_pipeline_recovery") == 2
+    assert "shutdown" not in source
+
+
+def test_callback_exceptions_are_isolated_to_one_frame():
+    source = ast.unparse(_method("pipeline_callback"))
+    assert "except Exception" in source
+    assert "Gst.FlowReturn.OK" in source
 
 
 def test_body_api_reexports_the_complete_face_api_contract_with_body_defaults():

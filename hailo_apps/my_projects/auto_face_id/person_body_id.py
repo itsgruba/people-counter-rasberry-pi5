@@ -13,13 +13,14 @@ import argparse
 import cv2
 import hailo
 import numpy as np
-from gi.repository import Gst
+from gi.repository import GLib, Gst
 
 from hailo_apps.python.core.common.buffer_utils import (
     get_caps_from_pad,
     get_numpy_from_buffer_efficient,
 )
 from hailo_apps.python.core.common.core import get_resource_path, resolve_hef_path
+from hailo_apps.python.core.common.hailo_logger import get_logger
 from hailo_apps.python.core.common.defines import (
     ALL_DETECTIONS_CROPPER_POSTPROCESS_SO_FILENAME,
     REID_CROPPER_POSTPROCESS_FUNCTION,
@@ -40,21 +41,26 @@ from hailo_apps.my_projects.auto_face_id.person_face_id import (
     PendingIdentity,
     PersonFaceIdApp,
     PersonFaceIdData,
-    logger,
 )
 
 
 BODY_REID_PIPELINE = "person_body_id"
 BODY_REID_MODEL = "repvgg_a0_person_reid_512"
+logger = get_logger(__name__)
 
 
 class PersonBodyIdApp(PersonFaceIdApp):
     """Reuse visit/counting storage while replacing face inference with body ReID."""
 
     def __init__(self, user_data, parser: argparse.ArgumentParser | None = None):
+        self._recovery_scheduled = False
         super().__init__(user_data, parser or self._build_body_parser())
         self.min_enroll_body_width_ratio = self.options_menu.min_enroll_body_width_ratio
         self.min_enroll_body_height_ratio = self.options_menu.min_enroll_body_height_ratio
+        configured_recovery_delay = self.options_menu.recovery_delay_seconds
+        if configured_recovery_delay is None:
+            configured_recovery_delay = 2 if self.camera_mode == CameraMode.ENTRY else 4
+        self.recovery_delay_seconds = max(1, configured_recovery_delay)
 
         logger.info("Identity input: whole person (RepVGG body ReID), no face model")
         logger.info("Person-body database: %s", self.database_dir / self.database_name)
@@ -86,6 +92,21 @@ class PersonBodyIdApp(PersonFaceIdApp):
             default=0.22,
             help="Minimum person bbox height relative to the full frame for saving a body photo.",
         )
+        parser.add_argument(
+            "--disable-watchdog",
+            action="store_false",
+            dest="enable_watchdog",
+            help="Disable automatic recovery when frame processing stalls.",
+        )
+        parser.add_argument(
+            "--recovery-delay-seconds",
+            type=int,
+            default=None,
+            help=(
+                "Delay before rebuilding a failed RTSP/Hailo pipeline. "
+                "Default: 2 seconds for ENTRY, 4 seconds for EXIT."
+            ),
+        )
         parser.set_defaults(
             database_name="persons_body.sqlite3",
             samples_directory="body_samples",
@@ -97,8 +118,43 @@ class PersonBodyIdApp(PersonFaceIdApp):
             min_enroll_blur_score=40.0,
             max_enroll_edge_margin=0.0,
             identity_track_max_gap_frames=25,
+            enable_watchdog=True,
         )
         return parser
+
+    def _schedule_pipeline_recovery(self, reason: str) -> None:
+        if self._recovery_scheduled or self._shutdown_started:
+            return
+        self._recovery_scheduled = True
+        self.watchdog_paused = True
+        delay = getattr(self, "recovery_delay_seconds", 2)
+        logger.warning(
+            "Pipeline recovery scheduled in %ds: reason=%s",
+            delay,
+            reason,
+        )
+        GLib.timeout_add_seconds(delay, self._rebuild_pipeline)
+
+    def _rebuild_pipeline(self):
+        self._recovery_scheduled = True
+        try:
+            return super()._rebuild_pipeline()
+        finally:
+            self._recovery_scheduled = False
+
+    def bus_call(self, bus, message, loop):
+        """Recover live streams instead of terminating on transient ERROR/EOS."""
+        if message.type == Gst.MessageType.ERROR:
+            error, debug = message.parse_error()
+            logger.error("GStreamer error: %s; debug: %s", error, debug)
+            self.error_occurred = True
+            self._schedule_pipeline_recovery("gstreamer-error")
+            return True
+        if message.type == Gst.MessageType.EOS and self.source_type != "file":
+            logger.warning("Unexpected end of live stream")
+            self._schedule_pipeline_recovery("live-stream-eos")
+            return True
+        return super().bus_call(bus, message, loop)
 
     def _resolve_identity_pipeline_resources(self) -> None:
         self.body_reid_hef_path = resolve_hef_path(
@@ -247,6 +303,21 @@ class PersonBodyIdApp(PersonFaceIdApp):
         return self._apply_low_latency_queue_policy(pipeline)
 
     def pipeline_callback(self, element, buffer, user_data):
+        """Keep a malformed frame or transient storage failure from killing the stream."""
+        try:
+            return self._pipeline_callback_impl(element, buffer, user_data)
+        except Exception:  # noqa: BLE001 - this is the live-pipeline isolation boundary
+            frame_number = user_data.get_count()
+            self.recognition_stats["callback_errors"] = (
+                self.recognition_stats.get("callback_errors", 0) + 1
+            )
+            logger.exception(
+                "Body identity callback failed on frame %d; frame skipped",
+                frame_number,
+            )
+            return Gst.FlowReturn.OK
+
+    def _pipeline_callback_impl(self, element, buffer, user_data):
         if buffer is None:
             logger.warning("Received None buffer.")
             return
