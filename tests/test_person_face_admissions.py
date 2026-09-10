@@ -54,6 +54,14 @@ class AdmissionTests(unittest.TestCase):
         app._enroll_if_ready(10, object(), object(), 100, 100)
         app._create_person_from_pending_samples.assert_not_called()
 
+    def test_one_embedding_is_enough_after_crossing(self):
+        app = isolated_app()
+        app.pending_unknowns[10] = SimpleNamespace(samples=[1], first_seen_time=0)
+        app.entry_detector.uncounted_crossing.return_value = object()
+        app._enroll_if_ready(10, object(), object(), 100, 100)
+        app._create_person_from_pending_samples.assert_called_once()
+        self.assertEqual(app.track_to_global_id[10], "new-1")
+
     def test_no_historical_search_in_callback_or_enrollment(self):
         for name in ('pipeline_callback', '_enroll_if_ready'):
             calls = {n.func.attr for n in ast.walk(METHODS[name]) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)}

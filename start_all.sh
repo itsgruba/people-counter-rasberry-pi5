@@ -36,14 +36,18 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
     --input "${ENTRY_INPUT:-rtsp://127.0.0.1:8554/cam}" \
     --width 640 \
     --height 640 \
+    --rtsp-latency-ms 300 \
+    --low-latency-queue-size 3 \
     --disable-sync \
     --show-fps \
     --disable-local-display \
     --enroll-zone-file hailo_apps/my_projects/auto_face_id/enroll_zone.txt \
     --notify-url "${NOTIFY_URL:-http://127.0.0.1:8000/api/events}" \
     --samples-per-person 3 \
-    --unknown-sample-interval 2 \
+    --max-pending-embeddings 10 \
+    --unknown-sample-interval 1 \
     --min-unknown-age-seconds 0.5 \
+    --entry-pending-resolution-seconds 5 \
     >> logs/entry.log 2>&1 &
 
 ENTRY_PID=$!
@@ -57,6 +61,8 @@ python3 hailo_apps/my_projects/auto_face_id/person_face_id.py \
     --input "${EXIT_INPUT:-rtsp://192.168.0.3:8554/cam}" \
     --width 640 \
     --height 640 \
+    --rtsp-latency-ms 300 \
+    --low-latency-queue-size 3 \
     --disable-sync \
     --show-fps \
     --disable-local-display \

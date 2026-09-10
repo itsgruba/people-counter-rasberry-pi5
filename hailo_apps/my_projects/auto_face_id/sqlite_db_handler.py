@@ -857,7 +857,7 @@ class SQLiteDatabaseHandler:
         self,
         record: dict[str, Any],
         embedding: np.ndarray,
-        sample: str,
+        sample: str | None,
         timestamp: int,
         sample_id: str | None = None,
     ) -> None:

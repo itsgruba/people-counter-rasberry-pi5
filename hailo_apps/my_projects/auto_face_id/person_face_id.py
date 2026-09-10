@@ -131,9 +131,10 @@ class PendingSample:
     """One candidate sample for a newly observed unknown face."""
 
     embedding: np.ndarray
-    image_path: str
+    image_path: str | None
     confidence: float
     timestamp: int
+    photo_quality_ok: bool = False
 
 
 @dataclass
@@ -457,6 +458,10 @@ class PersonFaceIdApp(GStreamerApp):
         # Enrollment and recognition tuning. These values decide when an
         # unknown face becomes a stable existing match or a brand-new person.
         self.samples_per_person = self.options_menu.samples_per_person
+        self.max_pending_embeddings = max(
+            self.samples_per_person,
+            self.options_menu.max_pending_embeddings,
+        )
         self.unknown_sample_interval = self.options_menu.unknown_sample_interval
         self.min_enroll_confidence = self.options_menu.min_enroll_confidence
         self.min_unknown_age_seconds = self.options_menu.min_unknown_age_seconds
@@ -684,6 +689,7 @@ class PersonFaceIdApp(GStreamerApp):
         # Runtime identity maps are keyed by Hailo person track_id. Track IDs are
         # short-lived camera-session IDs; global_id is the persistent DB identity.
         self.pending_unknowns: dict[int, PendingIdentity] = {}
+        self.known_track_last_sample_frame: dict[int, int] = {}
         self.face_track_embeddings: dict[int, np.ndarray] = {}
         self.track_to_global_id: dict[int, str] = {}
         self.track_to_label: dict[int, str] = {}
@@ -785,6 +791,15 @@ class PersonFaceIdApp(GStreamerApp):
             type=int,
             default=5,
             help="Number of unknown-face samples required before creating a new person.",
+        )
+        parser.add_argument(
+            "--max-pending-embeddings",
+            type=int,
+            default=10,
+            help=(
+                "Maximum embedding candidates retained for an unresolved track. "
+                "The best candidates are kept even when their JPEG is rejected. Default: 10."
+            ),
         )
         parser.add_argument(
             "--unknown-sample-interval",
@@ -1528,6 +1543,12 @@ class PersonFaceIdApp(GStreamerApp):
             "multiple_embeddings": 0,
             "branch_embeddings": 0,
             "branch_no_embedding": 0,
+            "invalid_embeddings": 0,
+            "candidate_embeddings": 0,
+            "candidate_photos": 0,
+            "candidate_without_photo": 0,
+            "outside_enroll_zone": 0,
+            "placeholder_backfills": 0,
         }
 
     @staticmethod
@@ -1592,6 +1613,16 @@ class PersonFaceIdApp(GStreamerApp):
             "Face embedding callback stats: embeddings=%d no_embedding=%d",
             stats["branch_embeddings"],
             stats["branch_no_embedding"],
+        )
+        logger.info(
+            "Enrollment stats: candidates=%d photos=%d embedding_only=%d "
+            "invalid=%d outside_zone=%d placeholder_backfills=%d",
+            stats["candidate_embeddings"],
+            stats["candidate_photos"],
+            stats["candidate_without_photo"],
+            stats["invalid_embeddings"],
+            stats["outside_enroll_zone"],
+            stats["placeholder_backfills"],
         )
         self.recognition_stats = self._new_recognition_stats()
 
@@ -1862,13 +1893,15 @@ class PersonFaceIdApp(GStreamerApp):
         timestamp: int,
     ) -> dict:
         """Create a new searchable person from whatever face samples are available."""
-        avg_embedding = np.mean([sample.embedding for sample in pending.samples], axis=0)
         for sample in pending.samples:
             self._move_sample_to_person_dir(sample, label)
 
-        best_sample = max(pending.samples, key=lambda sample: sample.confidence)
+        best_sample = max(
+            pending.samples,
+            key=lambda sample: (sample.photo_quality_ok, sample.confidence),
+        )
         new_person = self.db_handler.create_record(
-            embedding=avg_embedding,
+            embedding=best_sample.embedding,
             sample=best_sample.image_path,
             timestamp=timestamp,
             label=label,
@@ -1876,7 +1909,7 @@ class PersonFaceIdApp(GStreamerApp):
         )
 
         for sample in pending.samples:
-            if sample.image_path == best_sample.image_path:
+            if sample is best_sample:
                 continue
             current_record = self.db_handler.get_record_by_id(new_person["global_id"])
             if current_record is None:
@@ -1902,7 +1935,7 @@ class PersonFaceIdApp(GStreamerApp):
             last_seen_track_id=track_id,
         )
 
-    def _save_known_person_sample_if_empty(
+    def _save_known_person_sample_if_needed(
         self,
         global_id: str,
         label: str,
@@ -1912,31 +1945,47 @@ class PersonFaceIdApp(GStreamerApp):
         embedding_vector: np.ndarray,
         width: int,
         height: int,
+        frame_number: int,
     ) -> None:
-        """Fill a placeholder person with its first usable face sample."""
+        """Backfill a placeholder and improve it with a few later embeddings."""
         person = self.db_handler.get_record_by_id(global_id)
-        if person is None or person.get("samples_json"):
+        if person is None:
             return
-        if not self._is_good_enrollment_sample(frame, face_detection, width, height):
+        samples = person.get("samples_json") or []
+        if len(samples) >= self.samples_per_person:
+            return
+        previous_frame = self.known_track_last_sample_frame.get(track_id, -1)
+        if previous_frame >= 0 and frame_number - previous_frame < self.unknown_sample_interval:
+            return
+        normalized_embedding = self._normalized_embedding(embedding_vector)
+        if normalized_embedding is None:
+            self.recognition_stats["invalid_embeddings"] += 1
             return
 
-        sample_dir = self._person_sample_dir(label)
-        sample_dir.mkdir(parents=True, exist_ok=True)
-        image_path = sample_dir / f"{uuid.uuid4()}.jpeg"
-        cropped = self.crop_frame(frame, face_detection.get_bbox(), width, height)
-        if cropped.size == 0:
-            return
-        self.save_image_file(cropped, str(image_path))
+        image_path = None
+        if self._is_good_enrollment_sample(frame, face_detection, width, height):
+            sample_dir = self._person_sample_dir(label)
+            sample_dir.mkdir(parents=True, exist_ok=True)
+            candidate_path = sample_dir / f"{uuid.uuid4()}.jpeg"
+            cropped = self.crop_frame(frame, face_detection.get_bbox(), width, height)
+            if cropped.size:
+                self.save_image_file(cropped, str(candidate_path))
+                image_path = str(candidate_path)
         self.db_handler.insert_new_sample(
             record=person,
-            embedding=embedding_vector,
-            sample=str(image_path),
+            embedding=normalized_embedding,
+            sample=image_path,
             timestamp=int(time.time()),
         )
+        self.known_track_last_sample_frame[track_id] = frame_number
+        self.recognition_stats["placeholder_backfills"] += 1
         logger.info(
-            "Added first face sample for placeholder person label=%s track_id=%d",
+            "Stored recovery face embedding label=%s track_id=%d sample=%d/%d photo=%s",
             label,
             track_id,
+            len(samples) + 1,
+            self.samples_per_person,
+            "yes" if image_path else "no",
         )
 
     def _resolve_pending_entry_as_new_person(
@@ -2305,6 +2354,7 @@ class PersonFaceIdApp(GStreamerApp):
 
     def _on_pipeline_rebuilt(self) -> None:
         self.face_track_embeddings.clear()
+        self.known_track_last_sample_frame.clear()
         self._connect_face_embedding_callback()
 
     def face_embedding_callback(self, pad, info):
@@ -2903,6 +2953,8 @@ class PersonFaceIdApp(GStreamerApp):
             current = current.parent
 
     def _move_sample_to_person_dir(self, sample: PendingSample, label: str) -> None:
+        if not sample.image_path:
+            return
         source = Path(sample.image_path)
         target_dir = self._person_sample_dir(label)
         target_dir.mkdir(parents=True, exist_ok=True)
@@ -3049,6 +3101,8 @@ class PersonFaceIdApp(GStreamerApp):
     def _delete_pending_sample_files(self, pending: PendingIdentity) -> int:
         deleted = 0
         for sample in pending.samples:
+            if not sample.image_path:
+                continue
             sample_path = Path(sample.image_path)
             try:
                 sample_path.unlink(missing_ok=True)
@@ -3164,6 +3218,7 @@ class PersonFaceIdApp(GStreamerApp):
         """Bind an exit-camera track to the closest already-entered person."""
         self.track_to_global_id[track_id] = person["global_id"]
         self.track_to_label[track_id] = person["label"]
+        self.pending_unknowns.pop(track_id, None)
         self._add_identity_classification(
             person_detection,
             person["label"],
@@ -3235,9 +3290,32 @@ class PersonFaceIdApp(GStreamerApp):
                     )
                 continue
 
-            sample_path = Path(sample.image_path)
-            sample_path.unlink(missing_ok=True)
-            self._cleanup_empty_sample_dirs(sample_path.parent)
+            if sample.image_path:
+                sample_path = Path(sample.image_path)
+                sample_path.unlink(missing_ok=True)
+                self._cleanup_empty_sample_dirs(sample_path.parent)
+
+    @staticmethod
+    def _normalized_embedding(embedding_vector: np.ndarray) -> np.ndarray | None:
+        """Return a safe unit embedding, or None for corrupt inference output."""
+        vector = np.asarray(embedding_vector, dtype=np.float32).reshape(-1)
+        if vector.size != 512 or not np.all(np.isfinite(vector)):
+            return None
+        norm = float(np.linalg.norm(vector))
+        if norm <= 1e-8:
+            return None
+        return vector / norm
+
+    @classmethod
+    def _aggregate_embeddings(cls, samples: list[PendingSample]) -> np.ndarray:
+        """Average valid unit embeddings and normalize the identity vector."""
+        vectors = [cls._normalized_embedding(sample.embedding) for sample in samples]
+        valid_vectors = [vector for vector in vectors if vector is not None]
+        if not valid_vectors:
+            raise ValueError("Cannot create a person without a valid face embedding")
+        average = np.mean(valid_vectors, axis=0).astype(np.float32)
+        norm = float(np.linalg.norm(average))
+        return average / norm if norm > 1e-8 else valid_vectors[0]
 
     def _is_good_enrollment_sample(
         self,
@@ -3335,14 +3413,18 @@ class PersonFaceIdApp(GStreamerApp):
         height: int,
     ) -> None:
         pending = self.pending_unknowns.get(track_id)
-        if pending is None or len(pending.samples) < self.samples_per_person:
+        if pending is None or not pending.samples:
             return
         if time.time() - pending.first_seen_time < self.min_unknown_age_seconds:
             return
 
         # Entry identities belong to one admission, not to a remembered face.
-        # Collect samples before crossing, but only create a record after A -> B.
-        if self.entry_counter_enabled and self.entry_detector.uncounted_crossing(track_id) is None:
+        # One valid embedding is enough after A -> B; waiting for a fixed number
+        # caused short doorway tracks to become permanently unsearchable placeholders.
+        if self.entry_counter_enabled:
+            if self.entry_detector.uncounted_crossing(track_id) is None:
+                return
+        elif len(pending.samples) < self.samples_per_person:
             return
 
         label = self._make_person_label()
@@ -3407,16 +3489,8 @@ class PersonFaceIdApp(GStreamerApp):
         if track_id not in self.pending_unknowns:
             return
 
-        if len(self.pending_unknowns[track_id].samples) >= self.samples_per_person:
-            return
-
         if not self._is_inside_enroll_zone(person_detection, face_detection):
-            return
-
-        detection_confidence = face_detection.get_confidence()
-        if detection_confidence < self.min_enroll_confidence:
-            return
-        if not self._is_good_enrollment_sample(frame, face_detection, width, height):
+            self.recognition_stats["outside_enroll_zone"] += 1
             return
 
         pending = self.pending_unknowns.setdefault(track_id, PendingIdentity())
@@ -3426,19 +3500,57 @@ class PersonFaceIdApp(GStreamerApp):
         ):
             return
 
-        image_path = self._save_face_sample(track_id, frame, face_detection, width, height)
-        pending.samples.append(
-            PendingSample(
-                embedding=embedding_vector,
-                image_path=image_path,
-                confidence=detection_confidence,
-                timestamp=int(time.time()),
-            )
+        normalized_embedding = self._normalized_embedding(embedding_vector)
+        if normalized_embedding is None:
+            self.recognition_stats["invalid_embeddings"] += 1
+            return
+
+        detection_confidence = float(face_detection.get_confidence())
+        photo_quality_ok = (
+            detection_confidence >= self.min_enroll_confidence
+            and self._is_good_enrollment_sample(frame, face_detection, width, height)
         )
+        image_path = (
+            self._save_face_sample(track_id, frame, face_detection, width, height)
+            if photo_quality_ok
+            else None
+        )
+        candidate = PendingSample(
+            embedding=normalized_embedding,
+            image_path=image_path,
+            confidence=detection_confidence,
+            timestamp=int(time.time()),
+            photo_quality_ok=photo_quality_ok,
+        )
+        pending.samples.append(candidate)
+        pending.samples.sort(
+            key=lambda sample: (sample.photo_quality_ok, sample.confidence),
+            reverse=True,
+        )
+        while len(pending.samples) > self.max_pending_embeddings:
+            discarded = pending.samples.pop()
+            if discarded.image_path:
+                discarded_path = Path(discarded.image_path)
+                try:
+                    discarded_path.unlink(missing_ok=True)
+                    self._cleanup_empty_sample_dirs(discarded_path.parent)
+                except OSError as exc:
+                    logger.debug(
+                        "Failed to delete discarded candidate %s: %s",
+                        discarded_path,
+                        exc,
+                    )
+
         pending.last_sample_frame = frame_number
+        self.recognition_stats["candidate_embeddings"] += 1
+        if photo_quality_ok:
+            self.recognition_stats["candidate_photos"] += 1
+        else:
+            self.recognition_stats["candidate_without_photo"] += 1
+        photo_count = sum(sample.photo_quality_ok for sample in pending.samples)
         print(
-            f"collecting: track_id={track_id} samples="
-            f"{len(pending.samples)}/{self.samples_per_person}"
+            f"collecting: track_id={track_id} embeddings="
+            f"{len(pending.samples)}/{self.max_pending_embeddings} photos={photo_count}"
         )
         self._enroll_if_ready(track_id, person_detection, frame, width, height)
 
@@ -3767,7 +3879,7 @@ class PersonFaceIdApp(GStreamerApp):
                 if self.camera_mode == CameraMode.ENTRY and frame is None:
                     frame = get_numpy_from_buffer_efficient(buffer, fmt, width, height)
                 if self.camera_mode == CameraMode.ENTRY and frame is not None:
-                    self._save_known_person_sample_if_empty(
+                    self._save_known_person_sample_if_needed(
                         known_global_id,
                         known_label,
                         matched_person_track_id,
@@ -3776,6 +3888,7 @@ class PersonFaceIdApp(GStreamerApp):
                         embedding_vector,
                         width,
                         height,
+                        frame_number,
                     )
                 continue
 
@@ -3807,10 +3920,29 @@ class PersonFaceIdApp(GStreamerApp):
                     )
                     continue
 
-                self._bind_entered_person_for_exit_camera(
+                stable_vote = self._record_pending_vote(
                     matched_person_track_id,
                     person,
                     confidence,
+                )
+                if stable_vote is None or stable_vote.global_id is None:
+                    stats["unknown"] += 1
+                    logger.debug(
+                        "Exit recognition is waiting for stable votes: "
+                        "track_id=%d confidence=%.2f",
+                        matched_person_track_id,
+                        confidence,
+                    )
+                    continue
+                stable_person = self.db_handler.get_record_by_id(stable_vote.global_id)
+                if stable_person is None:
+                    stats["unknown"] += 1
+                    continue
+
+                self._bind_entered_person_for_exit_camera(
+                    matched_person_track_id,
+                    stable_person,
+                    stable_vote.confidence,
                     matched_person,
                     frame,
                     width,
