@@ -28,6 +28,15 @@ def _method(name: str) -> ast.FunctionDef:
     )
 
 
+def _module_function(name: str) -> ast.FunctionDef:
+    tree = ast.parse(SOURCE.read_text())
+    return next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+
+
 def _called_attributes(method: ast.FunctionDef) -> set[str]:
     return {
         node.func.attr
@@ -83,6 +92,19 @@ def test_callback_exceptions_are_isolated_to_one_frame():
     source = ast.unparse(_method("pipeline_callback"))
     assert "except Exception" in source
     assert "Gst.FlowReturn.OK" in source
+
+
+def test_stalled_hailo_worker_uses_process_restart_not_in_process_rebuild():
+    source = ast.unparse(_method("_rebuild_pipeline"))
+    assert "os._exit(RESTART_EXIT_CODE)" in source
+    assert "super()._rebuild_pipeline" not in source
+
+
+def test_supervisor_restarts_the_same_body_command():
+    source = ast.unparse(_module_function("_run_supervisor"))
+    assert "subprocess.Popen" in source
+    assert "sys.argv[1:]" in source
+    assert "BODY_WORKER_ENV" in source
 
 
 def test_body_api_reexports_the_complete_face_api_contract_with_body_defaults():

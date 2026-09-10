@@ -9,6 +9,12 @@ face recognition are deliberately not part of this pipeline.
 from __future__ import annotations
 
 import argparse
+import os
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
 
 import cv2
 import hailo
@@ -36,6 +42,7 @@ from hailo_apps.python.core.gstreamer.gstreamer_helper_pipelines import (
     TRACKER_PIPELINE,
     USER_CALLBACK_PIPELINE,
 )
+from hailo_apps.my_projects.auto_face_id import person_face_id as shared_identity
 from hailo_apps.my_projects.auto_face_id.person_face_id import (
     CameraMode,
     PendingIdentity,
@@ -46,6 +53,8 @@ from hailo_apps.my_projects.auto_face_id.person_face_id import (
 
 BODY_REID_PIPELINE = "person_body_id"
 BODY_REID_MODEL = "repvgg_a0_person_reid_512"
+BODY_WORKER_ENV = "PERSON_BODY_ID_WORKER"
+RESTART_EXIT_CODE = 75
 logger = get_logger(__name__)
 
 
@@ -54,6 +63,9 @@ class PersonBodyIdApp(PersonFaceIdApp):
 
     def __init__(self, user_data, parser: argparse.ArgumentParser | None = None):
         self._recovery_scheduled = False
+        # Shared admission/counting methods use their module logger. In this
+        # dedicated worker make those messages identify the body app correctly.
+        shared_identity.logger = logger
         super().__init__(user_data, parser or self._build_body_parser())
         self.min_enroll_body_width_ratio = self.options_menu.min_enroll_body_width_ratio
         self.min_enroll_body_height_ratio = self.options_menu.min_enroll_body_height_ratio
@@ -61,6 +73,8 @@ class PersonBodyIdApp(PersonFaceIdApp):
         if configured_recovery_delay is None:
             configured_recovery_delay = 2 if self.camera_mode == CameraMode.ENTRY else 4
         self.recovery_delay_seconds = max(1, configured_recovery_delay)
+        self.watchdog_timeout = max(5, self.options_menu.watchdog_timeout_seconds)
+        self.watchdog_interval = max(1, self.options_menu.watchdog_interval_seconds)
 
         logger.info("Identity input: whole person (RepVGG body ReID), no face model")
         logger.info("Person-body database: %s", self.database_dir / self.database_name)
@@ -107,6 +121,18 @@ class PersonBodyIdApp(PersonFaceIdApp):
                 "Default: 2 seconds for ENTRY, 4 seconds for EXIT."
             ),
         )
+        parser.add_argument(
+            "--watchdog-timeout-seconds",
+            type=int,
+            default=20,
+            help="Restart after this many seconds without processed frames. Default: 20.",
+        )
+        parser.add_argument(
+            "--watchdog-interval-seconds",
+            type=int,
+            default=5,
+            help="How often watchdog checks frame progress. Default: 5.",
+        )
         parser.set_defaults(
             database_name="persons_body.sqlite3",
             samples_directory="body_samples",
@@ -136,11 +162,20 @@ class PersonBodyIdApp(PersonFaceIdApp):
         GLib.timeout_add_seconds(delay, self._rebuild_pipeline)
 
     def _rebuild_pipeline(self):
-        self._recovery_scheduled = True
-        try:
-            return super()._rebuild_pipeline()
-        finally:
-            self._recovery_scheduled = False
+        """Exit the worker; its supervisor performs a clean Hailo restart.
+
+        Releasing and reopening two Hailo pipelines from inside a stalled,
+        multi-threaded GStreamer process can itself deadlock. A process boundary
+        reliably closes native threads, file descriptors, and device contexts.
+        """
+        logger.error(
+            "Worker pipeline is stalled; requesting clean process restart (exit=%d)",
+            RESTART_EXIT_CODE,
+        )
+        # Do not run graceful Hailo/SQLite teardown here: another stalled native
+        # thread may hold a lock forever. os._exit closes descriptors at the OS
+        # boundary; SQLite WAL keeps committed transactions recoverable.
+        os._exit(RESTART_EXIT_CODE)
 
     def bus_call(self, bus, message, loop):
         """Recover live streams instead of terminating on transient ERROR/EOS."""
@@ -510,7 +545,7 @@ class PersonBodyIdApp(PersonFaceIdApp):
                 roi.remove_object(detection)
 
 
-def main() -> None:
+def _run_worker() -> None:
     logger.info("Starting whole-person body ReID app.")
     user_data = PersonFaceIdData()
     app = PersonBodyIdApp(user_data)
@@ -519,6 +554,71 @@ def main() -> None:
     finally:
         if app.rtsp_debug is not None:
             app.rtsp_debug.close()
+
+
+def _supervisor_delay(argv: list[str]) -> int:
+    for index, argument in enumerate(argv):
+        if argument == "--recovery-delay-seconds" and index + 1 < len(argv):
+            try:
+                return max(1, int(argv[index + 1]))
+            except ValueError:
+                break
+        if argument.startswith("--recovery-delay-seconds="):
+            try:
+                return max(1, int(argument.split("=", 1)[1]))
+            except ValueError:
+                break
+
+    camera_mode = CameraMode.ENTRY.value
+    for index, argument in enumerate(argv):
+        if argument == "--camera-mode" and index + 1 < len(argv):
+            camera_mode = argv[index + 1]
+            break
+        if argument.startswith("--camera-mode="):
+            camera_mode = argument.split("=", 1)[1]
+            break
+    return 2 if camera_mode == CameraMode.ENTRY.value else 4
+
+
+def _run_supervisor() -> None:
+    command = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+    worker_environment = os.environ.copy()
+    worker_environment[BODY_WORKER_ENV] = "1"
+    restart_delay = _supervisor_delay(sys.argv[1:])
+    restart_number = 0
+
+    logger.info("Body ID supervisor started; worker restarts are enabled")
+    while True:
+        restart_number += 1
+        logger.info("Starting Body ID worker generation=%d", restart_number)
+        worker = subprocess.Popen(command, env=worker_environment)
+        try:
+            return_code = worker.wait()
+        except KeyboardInterrupt:
+            logger.info("Stopping Body ID supervisor and worker")
+            if worker.poll() is None:
+                worker.send_signal(signal.SIGINT)
+                try:
+                    worker.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    worker.kill()
+                    worker.wait()
+            return
+
+        logger.warning(
+            "Body ID worker exited with code=%d; restarting generation=%d in %ds",
+            return_code,
+            restart_number + 1,
+            restart_delay,
+        )
+        time.sleep(restart_delay)
+
+
+def main() -> None:
+    if os.environ.get(BODY_WORKER_ENV) == "1":
+        _run_worker()
+        return
+    _run_supervisor()
 
 
 if __name__ == "__main__":
