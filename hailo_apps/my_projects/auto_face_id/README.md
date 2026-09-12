@@ -130,6 +130,24 @@ If the package is installed, the same CLI is available as:
 hailo-auto-face-db inspect
 ```
 
+The body ReID database has the same maintenance commands, but operates on
+`database/persons_body.sqlite3` and `body_samples/`:
+
+```bash
+python3 hailo_apps/my_projects/auto_face_id/manage_body_database.py inspect
+python3 hailo_apps/my_projects/auto_face_id/manage_body_database.py delete-person --label person_1
+python3 hailo_apps/my_projects/auto_face_id/manage_body_database.py delete-person --global-id <uuid>
+python3 hailo_apps/my_projects/auto_face_id/manage_body_database.py clear-all
+python3 hailo_apps/my_projects/auto_face_id/manage_body_database.py prune-samples
+python3 hailo_apps/my_projects/auto_face_id/manage_body_database.py repair
+```
+
+If the package is installed, the body CLI is also available as:
+
+```bash
+hailo-auto-body-db clear-all
+```
+
 ## Dashboard API
 
 For a small frontend, run the FastAPI backend:

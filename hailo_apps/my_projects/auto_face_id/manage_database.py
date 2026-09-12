@@ -21,12 +21,15 @@ SAMPLES_DIR = PROJECT_DIR / "samples"
 DB_NAME = "persons.sqlite3"
 
 
-def _create_db() -> SQLiteDatabaseHandler:
+def _create_db(
+    db_name: str = DB_NAME,
+    samples_dir: Path = SAMPLES_DIR,
+) -> SQLiteDatabaseHandler:
     return SQLiteDatabaseHandler(
-        db_name=DB_NAME,
+        db_name=db_name,
         threshold=0.55,
         database_dir=DATABASE_DIR,
-        samples_dir=SAMPLES_DIR,
+        samples_dir=samples_dir,
     )
 
 
@@ -143,9 +146,11 @@ def _repair_embeddings(db: SQLiteDatabaseHandler) -> int:
     return updated
 
 
-def build_parser() -> argparse.ArgumentParser:
+def build_parser(
+    description: str = "Inspect, delete, and repair the auto face ID SQLite database.",
+) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Inspect, delete, and repair the auto face ID SQLite database."
+        description=description
     )
     subparsers = parser.add_subparsers(dest="command")
 
@@ -179,12 +184,17 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def main() -> None:
-    args = build_parser().parse_args()
+def main(
+    *,
+    db_name: str = DB_NAME,
+    samples_dir: Path = SAMPLES_DIR,
+    description: str = "Inspect, delete, and repair the auto face ID SQLite database.",
+) -> None:
+    args = build_parser(description).parse_args()
     if not getattr(args, "command", None):
         args.command = "inspect"
 
-    db = _create_db()
+    db = _create_db(db_name=db_name, samples_dir=samples_dir)
     try:
         if args.command == "inspect":
             _print_summary(db)
